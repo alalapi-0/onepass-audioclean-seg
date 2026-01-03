@@ -14,6 +14,7 @@ from onepass_audioclean_seg.constants import (
     DEFAULT_MIN_SILENCE_SEC,
     DEFAULT_PAD_SEC,
     DEFAULT_STRATEGY,
+    DEFAULT_SILENCE_THRESHOLD_DB,
     STRATEGY_CHOICES,
 )
 from onepass_audioclean_seg.deps import DepsChecker, format_text_output
@@ -115,6 +116,18 @@ def create_parser() -> argparse.ArgumentParser:
         help=f"最小静音时长（秒，默认: {DEFAULT_MIN_SILENCE_SEC}）",
     )
     segment_parser.add_argument(
+        "--silence-threshold-db",
+        type=float,
+        default=DEFAULT_SILENCE_THRESHOLD_DB,
+        help=f"静音检测阈值（dB，默认: {DEFAULT_SILENCE_THRESHOLD_DB}）",
+    )
+    segment_parser.add_argument(
+        "--analyze",
+        action="store_true",
+        default=False,
+        help="运行静音分析并输出 silences.json（默认: False）",
+    )
+    segment_parser.add_argument(
         "--min-seg-sec",
         type=float,
         default=DEFAULT_MIN_SEG_SEC,
@@ -202,17 +215,31 @@ def cmd_check_deps(args: argparse.Namespace) -> int:
 
 
 def cmd_segment(args: argparse.Namespace) -> int:
-    """执行 segment 子命令（R3：输入解析与计划）"""
+    """执行 segment 子命令（R3：输入解析与计划；R4：静音分析）"""
     from onepass_audioclean_seg.pipeline.resolver import InputResolver
     from onepass_audioclean_seg.pipeline.planner import SegmentPlanner
     
     input_path = Path(args.input_path)
     output_dir = Path(args.output_dir)
     
+    # 检查 --analyze 和 --dry-run 的冲突
+    if args.analyze and args.dry_run:
+        print("错误: --analyze 需要关闭 --dry-run", file=sys.stderr)
+        return 2
+    
+    # 检查 ffmpeg 是否存在（如果使用 analyze）
+    if args.analyze and args.strategy == "silence":
+        from onepass_audioclean_seg.audio.ffmpeg import which
+        ffmpeg_path = which("ffmpeg")
+        if ffmpeg_path is None:
+            print("错误: --analyze 需要 ffmpeg，但未找到", file=sys.stderr)
+            return 1
+    
     # 构建参数字典（用于写入报告）
     params = {
         "strategy": args.strategy,
         "min_silence_sec": args.min_silence_sec,
+        "silence_threshold_db": args.silence_threshold_db,
         "min_seg_sec": args.min_seg_sec,
         "max_seg_sec": args.max_seg_sec,
         "pad_sec": args.pad_sec,
@@ -222,6 +249,7 @@ def cmd_segment(args: argparse.Namespace) -> int:
         "pattern": args.pattern,
         "out_mode": args.out_mode,
         "dry_run": args.dry_run,
+        "analyze": args.analyze,
     }
     
     try:
@@ -230,10 +258,15 @@ def cmd_segment(args: argparse.Namespace) -> int:
         jobs = resolver.resolve(input_path, output_dir, args.out_mode)
         
         # 规划并执行（或 dry-run）
-        planner = SegmentPlanner(dry_run=args.dry_run, overwrite=args.overwrite)
+        planner = SegmentPlanner(
+            dry_run=args.dry_run,
+            overwrite=args.overwrite,
+            analyze=args.analyze,
+            silence_threshold_db=args.silence_threshold_db,
+        )
         executed_count = planner.plan_and_execute(jobs, params)
         
-        return 0
+        return planner.get_exit_code()
     except FileNotFoundError as e:
         print(f"错误: {e}", file=sys.stderr)
         return 1

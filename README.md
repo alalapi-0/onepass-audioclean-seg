@@ -115,7 +115,36 @@ audioclean-seg segment \
 - `--out-mode`: 输出模式，`in_place` 或 `out_root`（默认: `in_place`）
 - `--dry-run`: dry-run 模式，只打印计划不写入文件（默认: `False`）
 
-**注意**: R3 版本实现输入解析与计划输出，会生成 `seg_report.json` 但不会实际分段。后续版本将实现真实的 `silencedetect`、`energy`、`vad` 分段功能。
+#### R4 新功能：静音分析
+
+R4 版本引入 `--analyze` 参数，可以对音频运行 `ffmpeg silencedetect` 分析并输出静音区间中间文件。
+
+**基本用法**:
+
+```bash
+# 运行静音分析（需要关闭 --dry-run）
+audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --analyze
+
+# 指定静音检测阈值
+audioclean-seg segment \
+    --in audio.wav \
+    --out output_dir \
+    --analyze \
+    --silence-threshold-db -40 \
+    --min-silence-sec 0.35
+```
+
+**输出文件**:
+
+- `<out_dir>/silences.json`: 静音区间列表（JSON 格式）
+- `<out_dir>/seg_report.json`: 更新 `analysis.silence` 字段，包含分析摘要
+
+**注意**:
+- `--analyze` 需要关闭 `--dry-run`（两者不能同时使用）
+- 目前仅支持 `silence` 策略（其他策略会跳过分析）
+- 需要系统安装 `ffmpeg` 和 `ffprobe`
+
+**注意**: R3 版本实现输入解析与计划输出，会生成 `seg_report.json` 但不会实际分段。R4 版本实现了 `silencedetect` 静音分析功能，可以输出静音区间中间文件。后续版本将实现完整的 `silence`、`energy`、`vad` 分段功能。
 
 ### 全局选项
 
