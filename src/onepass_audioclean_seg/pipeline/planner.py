@@ -18,7 +18,9 @@ from onepass_audioclean_seg.pipeline.jobs import SegJob
 from onepass_audioclean_seg.pipeline.segments_from_silence import (
     apply_padding_and_clip,
     complement_to_speech_segments,
-    filter_min_duration,
+    enforce_max_duration_by_split,
+    enforce_min_duration_by_merge,
+    merge_overlaps,
     normalize_intervals,
 )
 from onepass_audioclean_seg.strategies.silence_ffmpeg import (
@@ -290,20 +292,50 @@ class SegmentPlanner:
             pad_sec = params.get("pad_sec", 0.1)
             padded_segments = apply_padding_and_clip(speech_segments, pad_sec, duration_sec)
             
-            # 7. 过滤最小时长
-            min_seg_sec = params.get("min_seg_sec", 1.0)
-            filtered_segments = filter_min_duration(padded_segments, min_seg_sec)
+            # 7. R6: 合并重叠/粘连的段
+            merged_segments = merge_overlaps(padded_segments, gap_merge_sec=0.0, overlap_tolerance=1e-3)
             
-            if not filtered_segments:
-                logger.warning(f"过滤后没有剩余片段")
+            # 8. R6: 通过合并短段来强制最小时长
+            min_seg_sec = params.get("min_seg_sec", 1.0)
+            max_seg_sec = params.get("max_seg_sec", 25.0)
+            merged_segments = enforce_min_duration_by_merge(merged_segments, min_seg_sec, max_seg_sec)
+            
+            # 9. R6: 通过切分超长段来强制最大时长
+            split_strategy = params.get("split_strategy", "equal")
+            final_segments = enforce_max_duration_by_split(merged_segments, max_seg_sec, min_seg_sec, split_strategy)
+            
+            # 最终排序和 round(3)
+            final_segments = sorted(final_segments, key=lambda x: x[0])
+            final_segments = [(round(s, 3), round(e, 3)) for s, e in final_segments]
+            
+            # 10. R6: 构建 SegmentRecord 列表（计算 pre_silence_sec、post_silence_sec、rms、energy_db）
+            segments_records = []
+            audio_path_abs = str(job.audio_path.resolve())
+            emit_wav = params.get("emit_wav", False)
+            overwrite = params.get("overwrite", False)
+            warnings_list = []
+            
+            # 如果启用 WAV 导出，创建输出目录
+            wav_dir = None
+            if emit_wav:
+                wav_dir = job.out_dir / "segments"
+                wav_dir.mkdir(parents=True, exist_ok=True)
+            
+            if not final_segments:
+                logger.warning(f"规整后没有剩余片段")
                 # 仍然写入空的 segments.jsonl 和更新报告
-                segments_records = []
             else:
-                # 8. 构建 SegmentRecord 列表（计算 pre_silence_sec 和 post_silence_sec）
-                segments_records = []
-                audio_path_abs = str(job.audio_path.resolve())
                 
-                for idx, (start, end) in enumerate(filtered_segments, start=1):
+                # 获取 ffmpeg 路径（用于 WAV 导出）
+                ffmpeg_path = None
+                if emit_wav:
+                    from onepass_audioclean_seg.audio.ffmpeg import which
+                    ffmpeg_path = which("ffmpeg")
+                    if ffmpeg_path is None:
+                        warnings_list.append("ffmpeg 未找到，无法导出 WAV 文件")
+                        emit_wav = False
+                
+                for idx, (start, end) in enumerate(final_segments, start=1):
                     seg_id = f"seg_{idx:06d}"
                     duration = end - start
                     
@@ -323,6 +355,42 @@ class SegmentPlanner:
                             post_silence_sec = silence.duration_sec
                             break
                     
+                    # R6: 计算 RMS 和 energy_db
+                    rms = None
+                    energy_db = None
+                    try:
+                        from onepass_audioclean_seg.audio.features import compute_rms, rms_to_db
+                        rms = compute_rms(job.audio_path, start, end)
+                        if rms is not None:
+                            energy_db = rms_to_db(rms)
+                    except Exception as e:
+                        logger.warning(f"计算 RMS 失败 {seg_id}: {e}")
+                        warnings_list.append(f"计算 RMS 失败 {seg_id}: {str(e)[:100]}")
+                    
+                    # R6: 导出 WAV 文件（如果启用）
+                    notes = None
+                    if emit_wav and wav_dir:
+                        wav_path = wav_dir / f"{seg_id}.wav"
+                        
+                        # 检查是否已存在且不需要覆盖
+                        if not overwrite and wav_path.exists():
+                            logger.debug(f"跳过已存在的 WAV 文件: {wav_path}")
+                        else:
+                            try:
+                                from onepass_audioclean_seg.audio.extract import extract_wav_segment
+                                success = extract_wav_segment(
+                                    job.audio_path,
+                                    wav_path,
+                                    start,
+                                    end,
+                                    ffmpeg_path,
+                                )
+                                if not success:
+                                    warnings_list.append(f"导出 WAV 失败 {seg_id}")
+                            except Exception as e:
+                                logger.warning(f"导出 WAV 失败 {seg_id}: {e}")
+                                warnings_list.append(f"导出 WAV 失败 {seg_id}: {str(e)[:100]}")
+                    
                     record = SegmentRecord(
                         id=seg_id,
                         start_sec=round(start, 3),
@@ -333,6 +401,9 @@ class SegmentPlanner:
                         post_silence_sec=round(post_silence_sec, 3),
                         is_speech=True,
                         strategy="silence",
+                        rms=rms,
+                        energy_db=energy_db,
+                        notes=notes,
                     )
                     segments_records.append(record)
             
@@ -340,15 +411,35 @@ class SegmentPlanner:
             segments_path = job.out_dir / "segments.jsonl"
             write_segments_jsonl(segments_path, segments_records)
             
-            # 10. 更新 seg_report.json
+            # 11. R6: 更新 seg_report.json（包含新的统计信息）
             speech_total_sec = sum(record.duration_sec for record in segments_records)
+            min_duration = min((r.duration_sec for r in segments_records), default=0.0)
+            max_duration = max((r.duration_sec for r in segments_records), default=0.0)
+            
             segments_report_data = {
                 "count": len(segments_records),
                 "speech_total_sec": round(speech_total_sec, 3),
                 "min_seg_sec": min_seg_sec,
+                "max_seg_sec": max_seg_sec,
                 "pad_sec": pad_sec,
+                "merge_overlaps": True,
+                "min_merge": True,
+                "max_split": split_strategy,
+                "rms_computed": any(r.rms is not None for r in segments_records),
                 "strategy": "silence",
             }
+            
+            # 添加 warnings 和 outputs
+            if warnings_list:
+                segments_report_data["warnings"] = warnings_list
+            
+            outputs = {
+                "segments_jsonl": str((job.out_dir / "segments.jsonl").resolve()),
+                "silences_json": str((job.out_dir / "silences.json").resolve()),
+                "segments_wav_dir": str(wav_dir.resolve()) if wav_dir and wav_dir.exists() else None,
+            }
+            segments_report_data["outputs"] = outputs
+            
             update_seg_report_segments(job.out_dir, segments_report_data)
             
             # 11. 打印成功信息

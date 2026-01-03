@@ -22,11 +22,14 @@ class SegmentRecord:
     post_silence_sec: float = 0.0
     is_speech: bool = True
     strategy: str = "silence"
+    rms: Optional[float] = None  # RMS 值（归一化到 [0, 1]）
+    energy_db: Optional[float] = None  # 能量 dB 值
+    notes: Optional[dict] = None  # 额外信息（如 split_reason, merged_from 等）
     
     def to_dict(self) -> dict:
         """转换为字典（用于 JSON 序列化）
         
-        注意：时间字段已 round(3)，但字典中可能还需要再 round 一次以确保一致性
+        注意：时间字段已 round(3)，rms 保留更高精度（round(6)），energy_db round(2)
         """
         data = asdict(self)
         # 确保时间字段都是 round(3)
@@ -35,6 +38,18 @@ class SegmentRecord:
         data["duration_sec"] = round(data["duration_sec"], 3)
         data["pre_silence_sec"] = round(data["pre_silence_sec"], 3)
         data["post_silence_sec"] = round(data["post_silence_sec"], 3)
+        
+        # rms 保留更高精度
+        if data.get("rms") is not None:
+            data["rms"] = round(data["rms"], 6)
+        
+        # energy_db 保留 2 位小数
+        if data.get("energy_db") is not None:
+            data["energy_db"] = round(data["energy_db"], 2)
+        
+        # 移除 None 值（可选，但为了 JSON 简洁性）
+        # 这里保留 None 值，让调用方决定是否过滤
+        
         return data
 
 

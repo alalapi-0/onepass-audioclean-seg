@@ -92,10 +92,11 @@ audioclean-seg segment \
     --in audio.wav \
     --out output_dir \
     --strategy silence \
-    --min-silence-sec 0.5 \
+    --min-silence-sec 0.35 \
     --min-seg-sec 1.0 \
-    --max-seg-sec 30.0 \
+    --max-seg-sec 25.0 \
     --pad-sec 0.1 \
+    --emit-segments \
     --emit-wav \
     --jobs 4 \
     --overwrite \
@@ -148,6 +149,24 @@ audioclean-seg segment \
 
 R5 版本引入 `--emit-segments` 参数，可以从静音区间生成语音片段并输出 `segments.jsonl`。
 
+#### R6 新功能：MVP 规整增强 + 能量特征 + 可选切片导出
+
+R6 版本实现了真正的 MVP 规整功能，包括：
+
+1. **规整算法增强**：
+   - 自动合并重叠/粘连的段（pad 后可能产生）
+   - 短段不再直接丢弃，而是确定性地向邻段合并（减少碎片）
+   - 超长段按等长策略切分（保证后续 ASR 可控）
+
+2. **能量特征计算**：
+   - 自动计算每个片段的 RMS（Root Mean Square）值
+   - 可选计算 energy_db（分贝值）
+   - 使用 Python wave 库读取 PCM 数据，无需额外依赖
+
+3. **可选 WAV 切片导出**：
+   - 使用 `--emit-wav` 参数可将每个片段导出为独立的 WAV 文件
+   - 输出到 `<out_dir>/segments/` 目录下
+
 **基本用法**:
 
 ```bash
@@ -161,33 +180,56 @@ audioclean-seg segment \
     --emit-segments \
     --strategy silence \
     --min-seg-sec 1.0 \
+    --max-seg-sec 25.0 \
+    --pad-sec 0.1
+
+# 生成片段并导出 WAV 文件
+audioclean-seg segment \
+    --in audio.wav \
+    --out output_dir \
+    --emit-segments \
+    --emit-wav \
+    --min-seg-sec 1.0 \
+    --max-seg-sec 25.0 \
     --pad-sec 0.1
 
 # 分步运行（先分析，再生成片段）
 audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --analyze
-audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --emit-segments --min-seg-sec 1.0 --pad-sec 0.1
+audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --emit-segments --min-seg-sec 1.0 --max-seg-sec 25.0 --pad-sec 0.1
 ```
 
 **输出文件**:
 
 - `<out_dir>/segments.jsonl`: 语音片段列表（JSONL 格式，一行一个片段）
+- `<out_dir>/segments/seg_*.wav`: 每个片段的 WAV 文件（如果启用 `--emit-wav`）
 - `<out_dir>/seg_report.json`: 更新 `segments` 字段，包含片段统计信息
 
-**segments.jsonl 格式**:
+**segments.jsonl 格式（R6 增强）**:
 
 每行是一个 JSON 对象，包含以下字段：
 
 - `id`: 片段 ID（如 `"seg_000001"`，按 start 升序编号）
-- `start_sec`: 片段开始时间（秒）
-- `end_sec`: 片段结束时间（秒）
-- `duration_sec`: 片段时长（秒）
+- `start_sec`: 片段开始时间（秒，round(3)）
+- `end_sec`: 片段结束时间（秒，round(3)）
+- `duration_sec`: 片段时长（秒，round(3)）
 - `source_audio`: 源音频文件路径（绝对路径）
-- `pre_silence_sec`: 该片段前一个静音区间的时长（秒，若没有则为 0）
-- `post_silence_sec`: 该片段后一个静音区间的时长（秒，若没有则为 0）
+- `pre_silence_sec`: 该片段前一个静音区间的时长（秒，若没有则为 0，round(3)）
+- `post_silence_sec`: 该片段后一个静音区间的时长（秒，若没有则为 0，round(3)）
 - `is_speech`: 是否为语音片段（`true`）
 - `strategy`: 分段策略（`"silence"`）
+- `rms`: RMS 值（归一化到 [0, 1]，round(6)，R6 新增）
+- `energy_db`: 能量 dB 值（round(2)，R6 新增，可选）
+- `notes`: 额外信息（如 `{"split_reason":"max_len"}` 或 `{"merged_from":2}`，R6 新增，可选）
 
-所有时间字段统一保留 3 位小数。
+所有时间字段统一保留 3 位小数，RMS 保留 6 位小数，energy_db 保留 2 位小数。
+
+**默认参数（R6 更新）**:
+
+- `--min-silence-sec`: 0.35（秒）
+- `--min-seg-sec`: 1.0（秒）
+- `--max-seg-sec`: 25.0（秒）
+- `--pad-sec`: 0.10（秒）
+- `--silence-threshold-db`: -35.0（dB）
 
 **注意**:
 
@@ -195,8 +237,17 @@ audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --emi
 - 如果 `silences.json` 不存在，`--emit-segments` 会自动触发分析（方案1，推荐）
 - 目前仅支持 `silence` 策略（其他策略会跳过并打印 SKIP-EMIT）
 - 如果 `segments.jsonl` 已存在且 `--overwrite=false`，会跳过该 job
+- `--emit-wav` 需要系统安装 `ffmpeg`，如果未找到会记录 warning 但不会导致整个 job 失败
+- 规整算法保证确定性：所有操作（合并、切分）都是可复现的
+- 超长段切分使用等长策略（`split_strategy="equal"`），保证可复现性
 
-**注意**: R3 版本实现输入解析与计划输出，会生成 `seg_report.json` 但不会实际分段。R4 版本实现了 `silencedetect` 静音分析功能，可以输出静音区间中间文件。R5 版本实现了从静音区间生成语音片段的功能，可以输出 `segments.jsonl`。后续版本将实现更复杂的分段策略（`energy`、`vad`）和片段合并功能。
+**版本说明**:
+
+- **R3**: 输入解析与计划输出，会生成 `seg_report.json` 但不会实际分段
+- **R4**: 实现了 `silencedetect` 静音分析功能，可以输出静音区间中间文件
+- **R5**: 实现了从静音区间生成语音片段的功能，可以输出 `segments.jsonl`
+- **R6**: 实现了 MVP 规整增强（merge/split）+ 能量特征 + 可选切片导出
+- 后续版本将实现更复杂的分段策略（`energy`、`vad`）和低能量点切分功能
 
 ### 全局选项
 
