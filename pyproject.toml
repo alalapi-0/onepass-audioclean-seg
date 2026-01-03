@@ -29,6 +29,9 @@ audioclean-seg = "onepass_audioclean_seg.cli:main"
 dev = [
     "pytest>=7.0.0",
 ]
+vad = [
+    "webrtcvad>=2.0.10",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

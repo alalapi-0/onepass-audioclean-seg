@@ -16,11 +16,12 @@ from onepass_audioclean_seg.audio.ffmpeg import (
 class DepsChecker:
     """依赖检查器：检查系统依赖并生成报告"""
     
-    def check(self, verbose: bool = False) -> dict[str, Any]:
+    def check(self, verbose: bool = False, strict: bool = False) -> dict[str, Any]:
         """执行依赖检查并返回报告字典
         
         Args:
             verbose: 是否输出详细信息
+            strict: 严格模式，webrtcvad 缺失也视为失败（默认 False，webrtcvad 为可选依赖）
         
         Returns:
             包含检查结果的字典，结构如下：
@@ -31,7 +32,8 @@ class DepsChecker:
                 "deps": {
                     "ffmpeg": {...},
                     "ffprobe": {...},
-                    "silencedetect": {...}
+                    "silencedetect": {...},
+                    "webrtcvad": {...}
                 },
                 "platform": {...},
                 "python": {...},
@@ -140,6 +142,39 @@ class DepsChecker:
             "detail": silencedetect_detail,
         }
         
+        # 检查 webrtcvad（可选依赖）
+        webrtcvad_ok = False
+        webrtcvad_version = None
+        webrtcvad_detail = ""
+        
+        try:
+            import webrtcvad
+            webrtcvad_ok = True
+            # webrtcvad 没有版本信息 API，只检查是否可导入
+            webrtcvad_detail = "可用"
+            if verbose:
+                try:
+                    # 尝试创建一个 Vad 实例来验证
+                    vad = webrtcvad.Vad(0)
+                    webrtcvad_detail = "可用（已验证）"
+                except Exception:
+                    webrtcvad_detail = "可用（导入成功）"
+        except ImportError:
+            webrtcvad_ok = False
+            webrtcvad_detail = "未安装（可选依赖）"
+        
+        # 仅在 strict 模式下将 webrtcvad 缺失视为失败
+        if strict and not webrtcvad_ok:
+            report["missing"].append("webrtcvad")
+            report["ok"] = False
+            report["error_code"] = "deps_missing"
+        
+        report["deps"]["webrtcvad"] = {
+            "ok": webrtcvad_ok,
+            "version": webrtcvad_version or "",
+            "detail": webrtcvad_detail,
+        }
+        
         # 如果没有缺失，确保 error_code 为 None
         if report["ok"]:
             report["error_code"] = None
@@ -160,7 +195,7 @@ def format_text_output(report: dict[str, Any], verbose: bool = False) -> str:
     lines = []
     
     # 检查各个依赖
-    for dep_name in ["ffmpeg", "ffprobe", "silencedetect"]:
+    for dep_name in ["ffmpeg", "ffprobe", "silencedetect", "webrtcvad"]:
         dep_info = report["deps"][dep_name]
         if dep_info["ok"]:
             if dep_name in ["ffmpeg", "ffprobe"]:
@@ -172,14 +207,22 @@ def format_text_output(report: dict[str, Any], verbose: bool = False) -> str:
                         lines.append(f"  Detail: {dep_info['detail']}")
                 else:
                     lines.append(f"{dep_name}: OK (path={path}, version={version})")
-            else:  # silencedetect
-                lines.append(f"{dep_name}: OK")
+            else:  # silencedetect 或 webrtcvad
+                status = "OK" if dep_info["ok"] else "MISSING (可选)"
+                lines.append(f"{dep_name}: {status}")
                 if verbose and dep_info.get("detail"):
                     lines.append(f"  Detail: {dep_info['detail']}")
+                elif not dep_info["ok"] and dep_name == "webrtcvad":
+                    lines.append(f"  Detail: {dep_info.get('detail', '未安装')}")
         else:
-            lines.append(f"{dep_name}: MISSING")
-            if verbose and dep_info.get("detail"):
-                lines.append(f"  Detail: {dep_info['detail']}")
+            if dep_name == "webrtcvad":
+                lines.append(f"{dep_name}: MISSING (可选)")
+                if verbose and dep_info.get("detail"):
+                    lines.append(f"  Detail: {dep_info['detail']}")
+            else:
+                lines.append(f"{dep_name}: MISSING")
+                if verbose and dep_info.get("detail"):
+                    lines.append(f"  Detail: {dep_info['detail']}")
     
     # 如果有关键依赖缺失，给出安装提示
     if not report["ok"]:

@@ -20,8 +20,11 @@ Repo2 分段模块：将长音频切成候选片段（segments）
 ## 安装
 
 ```bash
-# 开发安装
+# 开发安装（仅 silence 和 energy 策略）
 pip install -e ".[dev]"
+
+# 启用 VAD 策略（需要 webrtcvad）
+pip install -e ".[dev,vad]"
 ```
 
 ## 用法
@@ -45,7 +48,14 @@ audioclean-seg check-deps --verbose
 - `ffmpeg` 是否存在（PATH 可找到）且可执行
 - `ffprobe` 是否存在（PATH 可找到）且可执行
 - `ffmpeg` 是否支持 `silencedetect` 滤镜
+- `webrtcvad` 是否已安装（可选依赖，默认缺失不视为失败）
 - 输出版本信息
+
+**严格模式**（R9 新增）：
+```bash
+# 使用 --strict 模式，webrtcvad 缺失也会导致检查失败
+audioclean-seg check-deps --strict
+```
 
 #### 安装 ffmpeg
 
@@ -72,6 +82,55 @@ audioclean-seg check-deps --verbose
 - `--out-mode in_place`（默认）: 如果 job 有 workdir，输出到 `workdir/seg`；否则输出到 `out_root/<name>/seg`
 - `--out-mode out_root`: 全部输出到 `out_root` 下镜像目录（即使有 workdir 也不写回）
 
+#### 分段策略选择（R8/R9）
+
+R9 版本支持多种分段策略，通过 `--strategy` 参数选择：
+
+- **`silence`**（默认）：基于 ffmpeg silencedetect 的静音检测
+  - 依赖 ffmpeg 和 ffprobe
+  - 适用于静音明显的录音
+  - 参数：`--silence-threshold-db`、`--min-silence-sec`
+
+- **`energy`**：基于 RMS 能量的语音/非语音检测（纯 Python）
+  - 不依赖 ffmpeg，适合噪声底高、静音不明显的录音
+  - 参数：`--energy-frame-ms`、`--energy-hop-ms`、`--energy-smooth-ms`、`--energy-threshold-rms`、`--energy-min-speech-sec`
+
+- **`vad`**（R9 新增）：基于 webrtcvad 的语音活动检测
+  - 需要安装 webrtcvad：`pip install -e ".[vad]"` 或 `pip install webrtcvad>=2.0.10`
+  - 更贴近经典 VAD 算法，适合需要稳定离线 VAD 的场景
+  - 输入要求：PCM16 mono，采样率 8000/16000/32000/48000（推荐 16000）
+  - 若音频格式不符，策略会尝试使用 ffmpeg 自动重采样（如果 ffmpeg 可用）
+  - 参数：
+    - `--vad-aggressiveness`：攻击性级别 0..3（默认 2）
+    - `--vad-frame-ms`：帧长度 10/20/30（默认 30）
+    - `--vad-sample-rate`：目标采样率 8000/16000/32000/48000（默认 16000）
+    - `--vad-min-speech-sec`：最小语音长度（默认 0.20）
+
+**适用场景建议**：
+- 静音明显：使用 `silence` 策略（默认）
+- 噪声底高/静音不明显：尝试 `energy` 策略，并调整 `--energy-threshold-rms`（默认 0.02，可尝试 0.01-0.05）
+- 需要稳定 VAD：使用 `vad` 策略，推荐在 Repo1 ingest 阶段设置 `sample_rate=16000, channels=1` 以避免重采样开销
+
+#### 自动策略选择（Auto-strategy，R9 新增）
+
+R9 版本新增 `--auto-strategy` 功能，按顺序尝试多个策略，自动选择第一个通过质量门槛的策略：
+
+```bash
+# 启用 auto-strategy
+audioclean-seg segment --in workdir --out out_root --out-mode out_root --auto-strategy --emit-segments
+```
+
+**默认行为**：
+- 策略尝试顺序：`silence,vad,energy`（可通过 `--auto-strategy-order` 自定义）
+- 质量门槛：
+  - 最小片段数：`--auto-strategy-min-segments`（默认 2）
+  - 最小总语音时长：`--auto-strategy-min-speech-total-sec`（默认 3.0 秒）
+  - 避免覆盖几乎全长（speech_total_sec / duration < 0.98）
+
+**适用场景**：
+- 噪声底高/静音不明显时，启用 `--auto-strategy` 可自动降级到更合适的策略
+- 不确定使用哪个策略时，让系统自动选择
+
 #### 基本用法
 
 ```bash
@@ -87,20 +146,33 @@ audioclean-seg segment --in root_dir/ --out output_dir --out-mode out_root --dry
 # manifest.jsonl 文件
 audioclean-seg segment --in manifest.jsonl --out output_dir --dry-run
 
-# 指定分段策略和参数
+# 使用 silence 策略（默认）
 audioclean-seg segment \
     --in audio.wav \
     --out output_dir \
     --strategy silence \
     --min-silence-sec 0.35 \
+    --silence-threshold-db -35 \
     --min-seg-sec 1.0 \
     --max-seg-sec 25.0 \
     --pad-sec 0.1 \
     --emit-segments \
     --emit-wav \
     --jobs 4 \
-    --overwrite \
-    --dry-run
+    --overwrite
+
+# 使用 energy 策略（纯 Python，不依赖 ffmpeg）
+audioclean-seg segment \
+    --in audio.wav \
+    --out output_dir \
+    --out-mode out_root \
+    --strategy energy \
+    --energy-threshold-rms 0.02 \
+    --energy-min-speech-sec 0.20 \
+    --min-seg-sec 1.0 \
+    --max-seg-sec 25.0 \
+    --pad-sec 0.1 \
+    --emit-segments
 
 # 使用日志选项
 audioclean-seg segment \
@@ -109,6 +181,32 @@ audioclean-seg segment \
     --log-level DEBUG \
     --log-file segment.log
 ```
+
+#### R8 新功能：Energy 策略 + 统一策略接口
+
+R8 版本新增了 `energy` 策略和统一的策略接口：
+
+1. **Energy 策略**：
+   - 基于短帧 RMS（能量）判定语音/非语音
+   - 纯 Python 实现，不依赖 ffmpeg
+   - 支持平滑、滞回、最小静音约束
+   - 适用于噪声底高、静音不明显的录音
+
+2. **统一策略接口**：
+   - 所有策略实现 `SegmentStrategy.analyze()` 接口
+   - 返回统一的 `AnalysisResult` 对象
+   - 便于后续扩展新策略（如 R9 的 webrtcvad）
+
+**Energy 策略参数**：
+- `--energy-frame-ms`（默认 30）：帧长度（毫秒）
+- `--energy-hop-ms`（默认 10）：帧移（毫秒）
+- `--energy-smooth-ms`（默认 100）：平滑窗口长度（毫秒）
+- `--energy-threshold-rms`（默认 0.02）：RMS 阈值（归一化到 [0, 1]）
+- `--energy-min-speech-sec`（默认 0.20）：最小语音长度（秒，用于硬过滤极短语音岛）
+
+**输出文件**：
+- `energy.json`：Energy 策略的中间产物，包含 RMS 序列、语音段等信息
+- `segments.jsonl`：每个 segment 包含 `strategy` 字段（"silence" 或 "energy"）
 
 #### R3 新参数
 
@@ -142,8 +240,8 @@ audioclean-seg segment \
 
 **注意**:
 - `--analyze` 需要关闭 `--dry-run`（两者不能同时使用）
-- 目前仅支持 `silence` 策略（其他策略会跳过分析）
-- 需要系统安装 `ffmpeg` 和 `ffprobe`
+- `silence` 策略需要系统安装 `ffmpeg` 和 `ffprobe`
+- `energy` 策略不依赖 ffmpeg，纯 Python 实现
 
 #### R5 新功能：生成语音片段
 

@@ -6,11 +6,12 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from onepass_audioclean_seg.audio.ffmpeg import which
 from onepass_audioclean_seg.audio.probe import get_audio_duration_sec
 from onepass_audioclean_seg.io.report import (
+    read_seg_report,
     update_seg_report_analysis,
     update_seg_report_segments,
     write_seg_report,
@@ -25,11 +26,14 @@ from onepass_audioclean_seg.pipeline.segments_from_silence import (
     merge_overlaps,
     normalize_intervals,
 )
+from onepass_audioclean_seg.constants import DEFAULT_AUTO_STRATEGY_MAX_SPEECH_RATIO
+from onepass_audioclean_seg.strategies.base import AnalysisResult, SegmentStrategy
+from onepass_audioclean_seg.strategies.energy_rms import EnergyStrategy
 from onepass_audioclean_seg.strategies.silence_ffmpeg import (
     SilenceInterval,
-    parse_silencedetect_output,
-    run_silencedetect,
+    SilenceStrategy,
 )
+from onepass_audioclean_seg.strategies.vad_webrtc import VadStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -194,85 +198,65 @@ class SegmentPlanner:
         """
         return 1 if self.has_any_error else 0
     
+    def _get_strategy(self, strategy_name: str) -> SegmentStrategy:
+        """获取策略实例
+        
+        Args:
+            strategy_name: 策略名称（"silence"、"energy" 或 "vad"）
+        
+        Returns:
+            策略实例
+        
+        Raises:
+            ValueError: 不支持的策略名称
+        """
+        if strategy_name == "silence":
+            return SilenceStrategy()
+        elif strategy_name == "energy":
+            return EnergyStrategy()
+        elif strategy_name == "vad":
+            return VadStrategy()
+        else:
+            raise ValueError(f"不支持的策略: {strategy_name}")
+    
     def _run_analyze(self, job: SegJob, params: dict[str, Any]) -> bool:
-        """运行静音分析
+        """运行分析（使用策略接口）
         
         Args:
             job: 任务对象
             params: 参数字典
         """
-        strategy = params.get("strategy", "silence")
-        
-        # 只支持 silence 策略
-        if strategy != "silence":
-            print(f"SKIP-ANALYZE {job.job_id} reason=strategy_not_supported", file=sys.stdout)
-            return True
+        strategy_name = params.get("strategy", "silence")
         
         try:
             # 确保 out_dir 存在
             job.out_dir.mkdir(parents=True, exist_ok=True)
             
-            # 获取 ffmpeg 路径
-            ffmpeg_path = which("ffmpeg")
-            if ffmpeg_path is None:
-                raise RuntimeError("ffmpeg 未找到")
+            # 获取策略实例
+            strategy = self._get_strategy(strategy_name)
             
-            # 获取音频时长
-            duration_sec = get_audio_duration_sec(
-                audio_path=job.audio_path,
-                meta_path=job.meta_path,
-            )
+            # 运行分析
+            result = strategy.analyze(job, params)
             
-            # 运行 silencedetect
-            min_silence_sec = params.get("min_silence_sec", 0.5)
-            output_text = run_silencedetect(
-                ffmpeg_path=ffmpeg_path,
-                audio_path=job.audio_path,
-                threshold_db=self.silence_threshold_db,
-                min_silence_sec=min_silence_sec,
-            )
-            
-            # 解析输出
-            intervals = parse_silencedetect_output(output_text, duration_sec)
-            
-            # 写入 silences.json
-            silences_data = {
-                "audio_path": str(job.audio_path.resolve()),
-                "strategy": "silence",
-                "params": {
-                    "silence_threshold_db": self.silence_threshold_db,
-                    "min_silence_sec": min_silence_sec,
-                },
-                "duration_sec": round(duration_sec, 3) if duration_sec is not None else None,
-                "silences": [
-                    {
-                        "start_sec": interval.start_sec,
-                        "end_sec": interval.end_sec,
-                        "duration_sec": interval.duration_sec,
-                    }
-                    for interval in intervals
-                ],
-            }
-            
-            silences_path = job.out_dir / "silences.json"
-            with open(silences_path, "w", encoding="utf-8") as f:
-                json.dump(silences_data, f, ensure_ascii=False, indent=2)
-            
-            # 更新 seg_report.json
-            silences_total_sec = sum(interval.duration_sec for interval in intervals)
-            analysis_data = {
-                "silence": {
-                    "silences_count": len(intervals),
-                    "silences_total_sec": round(silences_total_sec, 3),
-                    "threshold_db": self.silence_threshold_db,
-                    "min_silence_sec": min_silence_sec,
-                    "duration_sec": round(duration_sec, 3) if duration_sec is not None else None,
-                }
-            }
+            # 更新 seg_report.json（按策略区分）
+            analysis_data = {strategy_name: result.stats}
             update_seg_report_analysis(job.out_dir, analysis_data)
             
             # 打印成功信息
-            print(f"ANALYZE {job.job_id} silences={len(intervals)} out={job.out_dir}", file=sys.stdout)
+            if strategy_name == "silence":
+                count = result.stats.get("silences_count", 0)
+                print(f"ANALYZE {job.job_id} strategy={strategy_name} silences={count} out={job.out_dir}", file=sys.stdout)
+            elif strategy_name == "energy":
+                frames = result.stats.get("frames", 0)
+                segments = result.stats.get("speech_raw_count", 0)
+                print(f"ANALYZE {job.job_id} strategy={strategy_name} frames={frames} segments={segments} out={job.out_dir}", file=sys.stdout)
+            elif strategy_name == "vad":
+                frames = result.stats.get("frames", 0)
+                segments = result.stats.get("speech_raw_count", 0)
+                print(f"ANALYZE {job.job_id} strategy={strategy_name} frames={frames} segments={segments} out={job.out_dir}", file=sys.stdout)
+            else:
+                print(f"ANALYZE {job.job_id} strategy={strategy_name} out={job.out_dir}", file=sys.stdout)
+            
             return True
             
         except Exception as e:
@@ -283,75 +267,75 @@ class SegmentPlanner:
             return False
     
     def _run_emit_segments(self, job: SegJob, params: dict[str, Any]) -> bool:
-        """生成语音片段并写入 segments.jsonl
+        """生成语音片段并写入 segments.jsonl（使用策略接口）
         
         Args:
             job: 任务对象
             params: 参数字典
         """
-        strategy = params.get("strategy", "silence")
+        # 检查是否启用 auto-strategy
+        auto_strategy = params.get("auto_strategy", False)
+        if auto_strategy:
+            return self._run_auto_strategy_emit_segments(job, params)
         
-        # 只支持 silence 策略
-        if strategy != "silence":
-            print(f"SKIP-EMIT {job.job_id} reason=strategy_not_supported", file=sys.stdout)
-            return True
+        strategy_name = params.get("strategy", "silence")
         
         try:
             # 确保 out_dir 存在
             job.out_dir.mkdir(parents=True, exist_ok=True)
             
-            # 1. 读取或生成 silences.json
-            silences_path = job.out_dir / "silences.json"
-            silences_data = None
+            # 1. 获取策略实例并运行分析（如果 artifact 不存在则自动触发）
+            strategy = self._get_strategy(strategy_name)
+            analysis_result: Optional[AnalysisResult] = None
             
-            if silences_path.exists():
-                # 读取现有的 silences.json
-                with open(silences_path, "r", encoding="utf-8") as f:
-                    silences_data = json.load(f)
-                logger.info(f"使用现有的 silences.json: {silences_path}")
-            else:
-                # 方案1（推荐）：自动触发分析
-                # 如果 analyze=True，_run_analyze 应该在 _run_emit_segments 之前执行
-                # 但如果 silences.json 仍不存在，说明 analyze 失败或未执行，我们尝试再次运行
-                logger.info(f"silences.json 不存在，自动触发分析")
-                self._run_analyze(job, params)
-                
-                # 重新读取 silences.json
-                if silences_path.exists():
-                    with open(silences_path, "r", encoding="utf-8") as f:
-                        silences_data = json.load(f)
-                else:
-                    raise RuntimeError("自动分析后 silences.json 仍不存在（分析可能失败）")
+            # 尝试读取现有 artifact（兼容性）
+            artifact_path = None
+            if strategy_name == "silence":
+                artifact_path = job.out_dir / "silences.json"
+            elif strategy_name == "energy":
+                artifact_path = job.out_dir / "energy.json"
+            elif strategy_name == "vad":
+                artifact_path = job.out_dir / "vad.json"
             
-            # 2. 获取 duration_sec（从 silences_data 或 meta.json 或 ffprobe）
-            duration_sec = None
-            if silences_data and "duration_sec" in silences_data:
-                duration_sec = silences_data.get("duration_sec")
+            if artifact_path and artifact_path.exists():
+                # 尝试从 artifact 重建 AnalysisResult（仅 silence 策略支持）
+                if strategy_name == "silence":
+                    try:
+                        with open(artifact_path, "r", encoding="utf-8") as f:
+                            silences_data = json.load(f)
+                        duration_sec = silences_data.get("duration_sec")
+                        if duration_sec:
+                            silence_intervals = [
+                                SilenceInterval(
+                                    start_sec=item["start_sec"],
+                                    end_sec=item["end_sec"],
+                                    duration_sec=item["duration_sec"],
+                                )
+                                for item in silences_data.get("silences", [])
+                            ]
+                            normalized_silences = normalize_intervals(silence_intervals, duration_sec)
+                            speech_segments_raw = complement_to_speech_segments(normalized_silences, duration_sec)
+                            analysis_result = AnalysisResult(
+                                strategy="silence",
+                                duration_sec=duration_sec,
+                                speech_segments_raw=speech_segments_raw,
+                                artifacts={"silences.json": artifact_path},
+                                stats=silences_data.get("params", {}),
+                            )
+                            logger.info(f"使用现有的 {artifact_path.name}")
+                    except Exception as e:
+                        logger.warning(f"读取现有 artifact 失败: {e}，将重新分析")
             
-            if duration_sec is None:
-                duration_sec = get_audio_duration_sec(
-                    audio_path=job.audio_path,
-                    meta_path=job.meta_path,
-                )
+            # 如果无法从 artifact 重建，运行分析
+            if analysis_result is None:
+                logger.info(f"运行策略分析: {strategy_name}")
+                analysis_result = strategy.analyze(job, params)
             
-            if duration_sec is None:
-                raise RuntimeError("无法获取音频时长（需要 meta.json 或 ffprobe）")
+            # 2. 获取 duration_sec
+            duration_sec = analysis_result.duration_sec
             
-            # 3. 解析静音区间
-            silence_intervals = [
-                SilenceInterval(
-                    start_sec=item["start_sec"],
-                    end_sec=item["end_sec"],
-                    duration_sec=item["duration_sec"],
-                )
-                for item in silences_data.get("silences", [])
-            ]
-            
-            # 4. 规范化静音区间
-            normalized_silences = normalize_intervals(silence_intervals, duration_sec)
-            
-            # 5. 生成语音段（补集）
-            speech_segments = complement_to_speech_segments(normalized_silences, duration_sec)
+            # 3. 使用 speech_segments_raw
+            speech_segments = analysis_result.speech_segments_raw
             
             # 6. 应用填充和裁剪
             pad_sec = params.get("pad_sec", 0.1)
@@ -404,21 +388,22 @@ class SegmentPlanner:
                     seg_id = f"seg_{idx:06d}"
                     duration = end - start
                     
-                    # 计算 pre_silence_sec 和 post_silence_sec
+                    # 计算 pre_silence_sec 和 post_silence_sec（仅 silence 策略支持）
                     pre_silence_sec = 0.0
                     post_silence_sec = 0.0
                     
-                    # 查找前一个静音区间（end == start，考虑容差 1e-3）
-                    for silence in normalized_silences:
-                        if abs(silence.end_sec - start) <= 0.001:
-                            pre_silence_sec = silence.duration_sec
-                            break
-                    
-                    # 查找后一个静音区间（start == end，考虑容差 1e-3）
-                    for silence in normalized_silences:
-                        if abs(silence.start_sec - end) <= 0.001:
-                            post_silence_sec = silence.duration_sec
-                            break
+                    if strategy_name == "silence" and analysis_result.nonspeech_segments_raw:
+                        # 查找前一个静音区间
+                        for silence_start, silence_end in analysis_result.nonspeech_segments_raw:
+                            if abs(silence_end - start) <= 0.001:
+                                pre_silence_sec = silence_end - silence_start
+                                break
+                        
+                        # 查找后一个静音区间
+                        for silence_start, silence_end in analysis_result.nonspeech_segments_raw:
+                            if abs(silence_start - end) <= 0.001:
+                                post_silence_sec = silence_end - silence_start
+                                break
                     
                     # R6: 计算 RMS 和 energy_db
                     rms = None
@@ -465,7 +450,7 @@ class SegmentPlanner:
                         pre_silence_sec=round(pre_silence_sec, 3),
                         post_silence_sec=round(post_silence_sec, 3),
                         is_speech=True,
-                        strategy="silence",
+                        strategy=strategy_name,
                         rms=rms,
                         energy_db=energy_db,
                         notes=notes,
@@ -495,7 +480,7 @@ class SegmentPlanner:
                 "min_merge": True,
                 "max_split": split_strategy,
                 "rms_computed": any(r.rms is not None for r in segments_records),
-                "strategy": "silence",
+                "strategy": strategy_name,
             }
             
             # 添加 warnings 和 outputs
@@ -504,9 +489,22 @@ class SegmentPlanner:
             
             outputs = {
                 "segments_jsonl": str((job.out_dir / "segments.jsonl").resolve()),
-                "silences_json": str((job.out_dir / "silences.json").resolve()),
-                "segments_wav_dir": str(wav_dir.resolve()) if wav_dir and wav_dir.exists() else None,
             }
+            # 根据策略添加 artifact
+            if strategy_name == "silence":
+                silences_path = job.out_dir / "silences.json"
+                if silences_path.exists():
+                    outputs["silences_json"] = str(silences_path.resolve())
+            elif strategy_name == "energy":
+                energy_path = job.out_dir / "energy.json"
+                if energy_path.exists():
+                    outputs["energy_json"] = str(energy_path.resolve())
+            elif strategy_name == "vad":
+                vad_path = job.out_dir / "vad.json"
+                if vad_path.exists():
+                    outputs["vad_json"] = str(vad_path.resolve())
+            if wav_dir and wav_dir.exists():
+                outputs["segments_wav_dir"] = str(wav_dir.resolve())
             segments_report_data["outputs"] = outputs
             
             update_seg_report_segments(job.out_dir, segments_report_data)
@@ -521,6 +519,337 @@ class SegmentPlanner:
             print(f"FAIL {job.job_id} error={error_msg}", file=sys.stdout)
             logger.error(f"生成片段失败 {job.job_id}: {e}", exc_info=True)
             return False
+    
+    def _run_auto_strategy_emit_segments(self, job: SegJob, params: dict[str, Any]) -> bool:
+        """使用 auto-strategy 生成语音片段（自动降级）
+        
+        Args:
+            job: 任务对象
+            params: 参数字典
+        """
+        # 获取参数
+        strategy_order_str = params.get("auto_strategy_order", "silence,vad,energy")
+        strategy_order = [s.strip() for s in strategy_order_str.split(",")]
+        min_segments = params.get("auto_strategy_min_segments", 2)
+        min_speech_total_sec = params.get("auto_strategy_min_speech_total_sec", 3.0)
+        max_speech_ratio = params.get("auto_strategy_max_speech_ratio", DEFAULT_AUTO_STRATEGY_MAX_SPEECH_RATIO)
+        
+        attempts = []
+        chosen_strategy = None
+        chosen_result = None
+        
+        # 依次尝试每个策略
+        for strategy_name in strategy_order:
+            attempt_info = {
+                "strategy": strategy_name,
+                "ok": False,
+                "reason": None,
+                "stats": {},
+            }
+            
+            try:
+                # 尝试运行策略
+                strategy = self._get_strategy(strategy_name)
+                analysis_result = strategy.analyze(job, params)
+                
+                # 运行 postprocess 得到最终 segments
+                final_segments = self._postprocess_segments(
+                    analysis_result.speech_segments_raw,
+                    analysis_result.duration_sec,
+                    params,
+                )
+                
+                # 评估质量
+                speech_total_sec = sum(e - s for s, e in final_segments)
+                segments_count = len(final_segments)
+                speech_ratio = speech_total_sec / analysis_result.duration_sec if analysis_result.duration_sec > 0 else 0.0
+                
+                # 质量门槛判断
+                reason = None
+                if segments_count < min_segments:
+                    reason = "too_few_segments"
+                elif speech_total_sec < min_speech_total_sec:
+                    reason = "too_short_speech"
+                elif speech_ratio >= max_speech_ratio:
+                    reason = "full_span"
+                
+                if reason is None:
+                    # 通过质量门槛，使用该策略
+                    chosen_strategy = strategy_name
+                    chosen_result = analysis_result
+                    attempt_info["ok"] = True
+                    attempt_info["stats"] = {
+                        "segments_count": segments_count,
+                        "speech_total_sec": round(speech_total_sec, 3),
+                        "speech_ratio": round(speech_ratio, 3),
+                    }
+                    attempts.append(attempt_info)
+                    break
+                else:
+                    # 未通过质量门槛
+                    attempt_info["reason"] = reason
+                    attempt_info["stats"] = {
+                        "segments_count": segments_count,
+                        "speech_total_sec": round(speech_total_sec, 3),
+                        "speech_ratio": round(speech_ratio, 3),
+                    }
+                    attempts.append(attempt_info)
+                    
+            except ImportError as e:
+                # 依赖缺失（如 webrtcvad）
+                attempt_info["reason"] = "missing_dependency"
+                attempt_info["error"] = str(e)[:100]
+                attempts.append(attempt_info)
+            except Exception as e:
+                # 其他错误
+                attempt_info["reason"] = "error"
+                attempt_info["error"] = str(e)[:100]
+                attempts.append(attempt_info)
+                logger.warning(f"策略 {strategy_name} 尝试失败: {e}")
+        
+        # 如果所有策略都失败
+        if chosen_strategy is None:
+            # 写入报告（记录尝试信息）
+            auto_strategy_data = {
+                "enabled": True,
+                "order": strategy_order,
+                "chosen": None,
+                "attempts": attempts,
+            }
+            self._update_seg_report_auto_strategy(job.out_dir, auto_strategy_data)
+            
+            error_msg = "所有策略都未通过质量门槛"
+            print(f"FAIL {job.job_id} error={error_msg}", file=sys.stdout)
+            logger.error(f"Auto-strategy 失败 {job.job_id}: {error_msg}")
+            return False
+        
+        # 使用选中的策略生成最终输出
+        params_with_chosen_strategy = params.copy()
+        params_with_chosen_strategy["strategy"] = chosen_strategy
+        
+        # 调用单策略版本的 _run_emit_segments（但跳过 auto-strategy 检查）
+        try:
+            job.out_dir.mkdir(parents=True, exist_ok=True)
+            strategy = self._get_strategy(chosen_strategy)
+            analysis_result = chosen_result
+            
+            # 运行 postprocess 并生成输出（复用现有逻辑）
+            duration_sec = analysis_result.duration_sec
+            speech_segments = analysis_result.speech_segments_raw
+            
+            pad_sec = params.get("pad_sec", 0.1)
+            padded_segments = apply_padding_and_clip(speech_segments, pad_sec, duration_sec)
+            merged_segments = merge_overlaps(padded_segments, gap_merge_sec=0.0, overlap_tolerance=1e-3)
+            
+            min_seg_sec = params.get("min_seg_sec", 1.0)
+            max_seg_sec = params.get("max_seg_sec", 25.0)
+            merged_segments = enforce_min_duration_by_merge(merged_segments, min_seg_sec, max_seg_sec)
+            
+            split_strategy = params.get("split_strategy", "equal")
+            final_segments = enforce_max_duration_by_split(merged_segments, max_seg_sec, min_seg_sec, split_strategy)
+            final_segments = sorted(final_segments, key=lambda x: x[0])
+            final_segments = [(round(s, 3), round(e, 3)) for s, e in final_segments]
+            
+            # 构建 SegmentRecord 列表（复用现有逻辑）
+            segments_records = []
+            audio_path_abs = str(job.audio_path.resolve())
+            emit_wav = params.get("emit_wav", False)
+            overwrite = params.get("overwrite", False)
+            warnings_list = []
+            
+            wav_dir = None
+            if emit_wav:
+                wav_dir = job.out_dir / "segments"
+                wav_dir.mkdir(parents=True, exist_ok=True)
+            
+            if not final_segments:
+                logger.warning(f"规整后没有剩余片段")
+            else:
+                ffmpeg_path = None
+                if emit_wav:
+                    from onepass_audioclean_seg.audio.ffmpeg import which
+                    ffmpeg_path = which("ffmpeg")
+                    if ffmpeg_path is None:
+                        warnings_list.append("ffmpeg 未找到，无法导出 WAV 文件")
+                        emit_wav = False
+                
+                for idx, (start, end) in enumerate(final_segments, start=1):
+                    seg_id = f"seg_{idx:06d}"
+                    duration = end - start
+                    
+                    pre_silence_sec = 0.0
+                    post_silence_sec = 0.0
+                    if chosen_strategy == "silence" and analysis_result.nonspeech_segments_raw:
+                        for silence_start, silence_end in analysis_result.nonspeech_segments_raw:
+                            if abs(silence_end - start) <= 0.001:
+                                pre_silence_sec = silence_end - silence_start
+                                break
+                        for silence_start, silence_end in analysis_result.nonspeech_segments_raw:
+                            if abs(silence_start - end) <= 0.001:
+                                post_silence_sec = silence_end - silence_start
+                                break
+                    
+                    rms = None
+                    energy_db = None
+                    try:
+                        from onepass_audioclean_seg.audio.features import compute_rms, rms_to_db
+                        rms = compute_rms(job.audio_path, start, end)
+                        if rms is not None:
+                            energy_db = rms_to_db(rms)
+                    except Exception as e:
+                        logger.warning(f"计算 RMS 失败 {seg_id}: {e}")
+                        warnings_list.append(f"计算 RMS 失败 {seg_id}: {str(e)[:100]}")
+                    
+                    notes = None
+                    if emit_wav and wav_dir:
+                        wav_path = wav_dir / f"{seg_id}.wav"
+                        if not overwrite and wav_path.exists():
+                            logger.debug(f"跳过已存在的 WAV 文件: {wav_path}")
+                        else:
+                            try:
+                                from onepass_audioclean_seg.audio.extract import extract_wav_segment
+                                success = extract_wav_segment(
+                                    job.audio_path,
+                                    wav_path,
+                                    start,
+                                    end,
+                                    ffmpeg_path,
+                                )
+                                if not success:
+                                    warnings_list.append(f"导出 WAV 失败 {seg_id}")
+                            except Exception as e:
+                                logger.warning(f"导出 WAV 失败 {seg_id}: {e}")
+                                warnings_list.append(f"导出 WAV 失败 {seg_id}: {str(e)[:100]}")
+                    
+                    record = SegmentRecord(
+                        id=seg_id,
+                        start_sec=round(start, 3),
+                        end_sec=round(end, 3),
+                        duration_sec=round(duration, 3),
+                        source_audio=audio_path_abs,
+                        pre_silence_sec=round(pre_silence_sec, 3),
+                        post_silence_sec=round(post_silence_sec, 3),
+                        is_speech=True,
+                        strategy=chosen_strategy,
+                        rms=rms,
+                        energy_db=energy_db,
+                        notes=notes,
+                    )
+                    segments_records.append(record)
+            
+            # 写入 segments.jsonl
+            segments_path = job.out_dir / "segments.jsonl"
+            write_segments_jsonl(segments_path, segments_records)
+            
+            # 验证输出
+            if self.validate_output:
+                self._validate_job_output(job, segments_path)
+            
+            # 更新报告
+            speech_total_sec = sum(record.duration_sec for record in segments_records)
+            min_duration = min((r.duration_sec for r in segments_records), default=0.0)
+            max_duration = max((r.duration_sec for r in segments_records), default=0.0)
+            
+            segments_report_data = {
+                "count": len(segments_records),
+                "speech_total_sec": round(speech_total_sec, 3),
+                "min_seg_sec": min_seg_sec,
+                "max_seg_sec": max_seg_sec,
+                "pad_sec": pad_sec,
+                "merge_overlaps": True,
+                "min_merge": True,
+                "max_split": split_strategy,
+                "rms_computed": any(r.rms is not None for r in segments_records),
+                "strategy": chosen_strategy,
+            }
+            
+            if warnings_list:
+                segments_report_data["warnings"] = warnings_list
+            
+            outputs = {
+                "segments_jsonl": str(segments_path.resolve()),
+            }
+            if chosen_strategy == "silence":
+                silences_path = job.out_dir / "silences.json"
+                if silences_path.exists():
+                    outputs["silences_json"] = str(silences_path.resolve())
+            elif chosen_strategy == "energy":
+                energy_path = job.out_dir / "energy.json"
+                if energy_path.exists():
+                    outputs["energy_json"] = str(energy_path.resolve())
+            elif chosen_strategy == "vad":
+                vad_path = job.out_dir / "vad.json"
+                if vad_path.exists():
+                    outputs["vad_json"] = str(vad_path.resolve())
+            if wav_dir and wav_dir.exists():
+                outputs["segments_wav_dir"] = str(wav_dir.resolve())
+            segments_report_data["outputs"] = outputs
+            
+            update_seg_report_segments(job.out_dir, segments_report_data)
+            
+            # 写入 auto-strategy 信息
+            auto_strategy_data = {
+                "enabled": True,
+                "order": strategy_order,
+                "chosen": chosen_strategy,
+                "attempts": attempts,
+            }
+            self._update_seg_report_auto_strategy(job.out_dir, auto_strategy_data)
+            
+            # 打印成功信息
+            print(f"EMIT {job.job_id} segments={len(segments_records)} strategy={chosen_strategy} out={job.out_dir}", file=sys.stdout)
+            return True
+            
+        except Exception as e:
+            error_msg = str(e)[:100]
+            print(f"FAIL {job.job_id} error={error_msg}", file=sys.stdout)
+            logger.error(f"Auto-strategy 生成片段失败 {job.job_id}: {e}", exc_info=True)
+            return False
+    
+    def _postprocess_segments(
+        self,
+        speech_segments_raw: list[tuple[float, float]],
+        duration_sec: float,
+        params: dict[str, Any],
+    ) -> list[tuple[float, float]]:
+        """对 speech_segments_raw 进行后处理（复用现有逻辑）
+        
+        Args:
+            speech_segments_raw: 原始语音段列表
+            duration_sec: 音频总时长
+            params: 参数字典
+        
+        Returns:
+            后处理后的片段列表
+        """
+        pad_sec = params.get("pad_sec", 0.1)
+        min_seg_sec = params.get("min_seg_sec", 1.0)
+        max_seg_sec = params.get("max_seg_sec", 25.0)
+        
+        padded_segments = apply_padding_and_clip(speech_segments_raw, pad_sec, duration_sec)
+        merged_segments = merge_overlaps(padded_segments, gap_merge_sec=0.0, overlap_tolerance=1e-3)
+        merged_segments = enforce_min_duration_by_merge(merged_segments, min_seg_sec, max_seg_sec)
+        split_strategy = params.get("split_strategy", "equal")
+        final_segments = enforce_max_duration_by_split(merged_segments, max_seg_sec, min_seg_sec, split_strategy)
+        final_segments = sorted(final_segments, key=lambda x: x[0])
+        final_segments = [(round(s, 3), round(e, 3)) for s, e in final_segments]
+        return final_segments
+    
+    def _update_seg_report_auto_strategy(self, out_dir: Path, auto_strategy_data: dict[str, Any]) -> None:
+        """更新 seg_report.json 的 auto_strategy 字段"""
+        report_path = out_dir / "seg_report.json"
+        existing_report = read_seg_report(report_path)
+        
+        if existing_report is None:
+            existing_report = {
+                "version": "R9",
+                "created_at": datetime.now().isoformat(),
+            }
+        
+        existing_report["auto_strategy"] = auto_strategy_data
+        
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(existing_report, f, ensure_ascii=False, indent=2)
     
     def _print_plan(self, job: SegJob) -> None:
         """打印单个 job 的计划行"""
@@ -642,11 +971,13 @@ class SegmentPlanner:
                     if isinstance(segments_data, dict):
                         speech_total_sec += segments_data.get("speech_total_sec", 0.0)
                     
-                    # 累加 silences_total_sec
+                    # 累加 silences_total_sec（从 silence 或 energy 策略）
                     analysis_data = report_data.get("analysis", {})
+                    # 尝试从 silence 策略获取
                     silence_data = analysis_data.get("silence", {})
                     if isinstance(silence_data, dict):
                         silences_total_sec += silence_data.get("silences_total_sec", 0.0)
+                    # 尝试从 energy 策略获取（energy 策略不直接提供 silences_total_sec，跳过）
                 except Exception:
                     pass  # 读取失败，跳过
         

@@ -1,12 +1,17 @@
 """FFmpeg silencedetect 运行器与解析器"""
 
+import json
 import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from onepass_audioclean_seg.audio.ffmpeg import run_cmd
+from onepass_audioclean_seg.audio.ffmpeg import run_cmd, which
+from onepass_audioclean_seg.audio.probe import get_audio_duration_sec
+from onepass_audioclean_seg.pipeline.jobs import SegJob
+from onepass_audioclean_seg.pipeline.segments_from_silence import complement_to_speech_segments, normalize_intervals
+from onepass_audioclean_seg.strategies.base import AnalysisResult, SegmentStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -197,4 +202,100 @@ def parse_silencedetect_output(
         ))
     
     return cleaned_intervals
+
+
+class SilenceStrategy(SegmentStrategy):
+    """Silence 策略：基于 ffmpeg silencedetect 的静音检测"""
+    
+    @property
+    def name(self) -> str:
+        return "silence"
+    
+    def analyze(
+        self,
+        job: SegJob,
+        params: dict[str, Any],
+    ) -> AnalysisResult:
+        """运行 silencedetect 分析并返回语音段
+        
+        Args:
+            job: 分段任务对象
+            params: 参数字典（包含 silence_threshold_db, min_silence_sec 等）
+        
+        Returns:
+            AnalysisResult 对象
+        """
+        # 获取参数
+        threshold_db = params.get("silence_threshold_db", -35.0)
+        min_silence_sec = params.get("min_silence_sec", 0.35)
+        
+        # 获取 ffmpeg 路径
+        ffmpeg_path = which("ffmpeg")
+        if ffmpeg_path is None:
+            raise RuntimeError("ffmpeg 未找到，无法运行 silence 策略")
+        
+        # 获取音频时长
+        duration_sec = get_audio_duration_sec(
+            audio_path=job.audio_path,
+            meta_path=job.meta_path,
+        )
+        if duration_sec is None:
+            raise RuntimeError("无法获取音频时长（需要 meta.json 或 ffprobe）")
+        
+        # 运行 silencedetect
+        output_text = run_silencedetect(
+            ffmpeg_path=ffmpeg_path,
+            audio_path=job.audio_path,
+            threshold_db=threshold_db,
+            min_silence_sec=min_silence_sec,
+        )
+        
+        # 解析输出
+        silence_intervals = parse_silencedetect_output(output_text, duration_sec)
+        
+        # 规范化静音区间
+        normalized_silences = normalize_intervals(silence_intervals, duration_sec)
+        
+        # 生成语音段（补集）
+        speech_segments_raw = complement_to_speech_segments(normalized_silences, duration_sec)
+        
+        # 构建 artifacts（写入 silences.json）
+        silences_data = {
+            "audio_path": str(job.audio_path.resolve()),
+            "strategy": "silence",
+            "params": {
+                "silence_threshold_db": threshold_db,
+                "min_silence_sec": min_silence_sec,
+            },
+            "duration_sec": round(duration_sec, 3),
+            "silences": [
+                {
+                    "start_sec": interval.start_sec,
+                    "end_sec": interval.end_sec,
+                    "duration_sec": interval.duration_sec,
+                }
+                for interval in normalized_silences
+            ],
+        }
+        
+        silences_path = self.write_artifact(job.out_dir, "silences.json", silences_data)
+        
+        # 构建 stats
+        silences_total_sec = sum(interval.duration_sec for interval in normalized_silences)
+        stats = {
+            "silences_count": len(normalized_silences),
+            "silences_total_sec": round(silences_total_sec, 3),
+            "threshold_db": threshold_db,
+            "min_silence_sec": min_silence_sec,
+        }
+        
+        return AnalysisResult(
+            strategy="silence",
+            duration_sec=round(duration_sec, 3),
+            speech_segments_raw=speech_segments_raw,
+            nonspeech_segments_raw=[(s.start_sec, s.end_sec) for s in normalized_silences],
+            artifacts={"silences.json": silences_path},
+            warnings=[],
+            stats=stats,
+        )
 
