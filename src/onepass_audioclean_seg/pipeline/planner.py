@@ -3,6 +3,8 @@
 import json
 import logging
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +44,7 @@ class SegmentPlanner:
         analyze: bool = False,
         emit_segments: bool = False,
         silence_threshold_db: float = -35.0,
+        validate_output: bool = False,
     ):
         """
         Args:
@@ -50,14 +53,17 @@ class SegmentPlanner:
             analyze: 是否运行静音分析
             emit_segments: 是否生成语音片段
             silence_threshold_db: 静音检测阈值（dB）
+            validate_output: 是否在生成 segments.jsonl 后立即验证
         """
         self.dry_run = dry_run
         self.overwrite = overwrite
         self.analyze = analyze
         self.emit_segments = emit_segments
         self.silence_threshold_db = silence_threshold_db
-        self.has_analyze_error = False  # 记录是否有 analyze 错误
-        self.has_emit_error = False  # 记录是否有 emit segments 错误
+        self.validate_output = validate_output
+        self.job_stats: list[dict[str, Any]] = []  # 记录每个 job 的统计信息
+        self.started_at = datetime.now().isoformat()
+        self.has_any_error = False  # 记录是否有任何错误
     
     def plan_and_execute(
         self,
@@ -78,8 +84,19 @@ class SegmentPlanner:
             return 0
         
         executed_count = 0
+        jobs_planned = len(jobs)
+        jobs_analyzed = 0
+        jobs_emitted = 0
+        jobs_failed: list[dict[str, Any]] = []
+        jobs_skipped = 0
         
         for job in jobs:
+            job_stat = {
+                "job_id": job.job_id,
+                "status": "pending",
+                "error": None,
+            }
+            
             # 检查是否跳过（如果 overwrite=False 且输出已存在）
             # 对于 emit_segments，检查 segments.jsonl；对于 analyze，检查 silences.json
             skip_file = None
@@ -91,6 +108,9 @@ class SegmentPlanner:
             if skip_file and not self.overwrite and skip_file.exists():
                 warnings_str = f" warnings={len(job.warnings)}" if job.warnings else ""
                 print(f"SKIP {job.job_id} audio={job.audio_path} out={job.out_dir}{warnings_str}", file=sys.stdout)
+                jobs_skipped += 1
+                job_stat["status"] = "skipped"
+                self.job_stats.append(job_stat)
                 continue
             
             # 打印计划
@@ -108,17 +128,61 @@ class SegmentPlanner:
                     executed_count += 1
                     
                     # 如果启用 analyze，运行静音分析
+                    analyze_success = True
                     if self.analyze:
-                        self._run_analyze(job, params)
+                        analyze_success = self._run_analyze(job, params)
+                        if analyze_success:
+                            jobs_analyzed += 1
+                            job_stat["status"] = "analyzed"
                     
                     # 如果启用 emit_segments，生成语音片段
+                    emit_success = True
                     if self.emit_segments:
-                        self._run_emit_segments(job, params)
+                        emit_success = self._run_emit_segments(job, params)
+                        if emit_success:
+                            jobs_emitted += 1
+                            if job_stat["status"] == "pending":
+                                job_stat["status"] = "emitted"
+                    
+                    # 如果失败，记录错误
+                    if not analyze_success or not emit_success:
+                        job_stat["status"] = "failed"
+                        reasons = []
+                        if not analyze_success:
+                            reasons.append("analyze 失败")
+                        if not emit_success:
+                            reasons.append("emit_segments 失败")
+                        job_stat["error"] = "; ".join(reasons)
+                        jobs_failed.append({
+                            "job_id": job.job_id,
+                            "reason": job_stat["error"],
+                        })
+                        self.has_any_error = True
                 except Exception as e:
                     logger.error(f"写入报告失败 {job.job_id}: {e}", exc_info=True)
                     print(f"ERROR {job.job_id} failed to write report: {e}", file=sys.stderr)
+                    job_stat["status"] = "failed"
+                    job_stat["error"] = str(e)[:100]
+                    jobs_failed.append({
+                        "job_id": job.job_id,
+                        "reason": job_stat["error"],
+                    })
             else:
                 executed_count += 1
+                job_stat["status"] = "planned"
+            
+            self.job_stats.append(job_stat)
+        
+        # 生成 run_summary.json
+        self._write_run_summary(
+            jobs=jobs,
+            params=params,
+            jobs_planned=jobs_planned,
+            jobs_analyzed=jobs_analyzed,
+            jobs_emitted=jobs_emitted,
+            jobs_failed=jobs_failed,
+            jobs_skipped=jobs_skipped,
+        )
         
         return executed_count
     
@@ -128,9 +192,9 @@ class SegmentPlanner:
         Returns:
             0 表示成功，1 表示有错误（analyze 或 emit_segments）
         """
-        return 1 if (self.has_analyze_error or self.has_emit_error) else 0
+        return 1 if self.has_any_error else 0
     
-    def _run_analyze(self, job: SegJob, params: dict[str, Any]) -> None:
+    def _run_analyze(self, job: SegJob, params: dict[str, Any]) -> bool:
         """运行静音分析
         
         Args:
@@ -142,7 +206,7 @@ class SegmentPlanner:
         # 只支持 silence 策略
         if strategy != "silence":
             print(f"SKIP-ANALYZE {job.job_id} reason=strategy_not_supported", file=sys.stdout)
-            return
+            return True
         
         try:
             # 确保 out_dir 存在
@@ -209,15 +273,16 @@ class SegmentPlanner:
             
             # 打印成功信息
             print(f"ANALYZE {job.job_id} silences={len(intervals)} out={job.out_dir}", file=sys.stdout)
+            return True
             
         except Exception as e:
             # 记录错误
-            self.has_analyze_error = True
             error_msg = str(e)[:100]  # 限制长度
             print(f"FAIL {job.job_id} error={error_msg}", file=sys.stdout)
             logger.error(f"分析失败 {job.job_id}: {e}", exc_info=True)
+            return False
     
-    def _run_emit_segments(self, job: SegJob, params: dict[str, Any]) -> None:
+    def _run_emit_segments(self, job: SegJob, params: dict[str, Any]) -> bool:
         """生成语音片段并写入 segments.jsonl
         
         Args:
@@ -229,7 +294,7 @@ class SegmentPlanner:
         # 只支持 silence 策略
         if strategy != "silence":
             print(f"SKIP-EMIT {job.job_id} reason=strategy_not_supported", file=sys.stdout)
-            return
+            return True
         
         try:
             # 确保 out_dir 存在
@@ -411,6 +476,10 @@ class SegmentPlanner:
             segments_path = job.out_dir / "segments.jsonl"
             write_segments_jsonl(segments_path, segments_records)
             
+            # 10. 如果启用 validate_output，立即验证
+            if self.validate_output:
+                self._validate_job_output(job, segments_path)
+            
             # 11. R6: 更新 seg_report.json（包含新的统计信息）
             speech_total_sec = sum(record.duration_sec for record in segments_records)
             min_duration = min((r.duration_sec for r in segments_records), default=0.0)
@@ -444,13 +513,14 @@ class SegmentPlanner:
             
             # 11. 打印成功信息
             print(f"EMIT {job.job_id} segments={len(segments_records)} out={job.out_dir}", file=sys.stdout)
+            return True
             
         except Exception as e:
             # 记录错误
-            self.has_emit_error = True
             error_msg = str(e)[:100]  # 限制长度
             print(f"FAIL {job.job_id} error={error_msg}", file=sys.stdout)
             logger.error(f"生成片段失败 {job.job_id}: {e}", exc_info=True)
+            return False
     
     def _print_plan(self, job: SegJob) -> None:
         """打印单个 job 的计划行"""
@@ -461,4 +531,157 @@ class SegmentPlanner:
             f"PLAN {job.job_id} audio={job.audio_path} out={job.out_dir} meta={meta_str}{warnings_str}",
             file=sys.stdout
         )
+    
+    def _validate_job_output(self, job: SegJob, segments_path: Path) -> None:
+        """验证 job 的输出
+        
+        Args:
+            job: 任务对象
+            segments_path: segments.jsonl 文件路径
+        """
+        try:
+            from onepass_audioclean_seg.validate import validate_segments_jsonl
+            
+            result = validate_segments_jsonl(segments_path, strict=False)
+            
+            errors_count = len(result.errors)
+            warnings_count = len(result.warnings)
+            ok = result.ok
+            
+            print(
+                f"VALIDATE {job.job_id} ok={ok} errors={errors_count} warnings={warnings_count}",
+                file=sys.stdout
+            )
+            
+            if not ok:
+                # 验证失败，标记为失败
+                self.has_any_error = True
+                # 输出前几个错误
+                for error in result.errors[:3]:
+                    print(f"  VALIDATE ERROR: {error}", file=sys.stderr)
+        except Exception as e:
+            logger.warning(f"验证输出失败 {job.job_id}: {e}", exc_info=True)
+            print(f"VALIDATE {job.job_id} ok=false errors=1 warnings=0 (验证过程异常: {str(e)[:50]})", file=sys.stdout)
+            self.has_any_error = True
+    
+    def _write_run_summary(
+        self,
+        jobs: list[SegJob],
+        params: dict[str, Any],
+        jobs_planned: int,
+        jobs_analyzed: int,
+        jobs_emitted: int,
+        jobs_failed: list[dict[str, Any]],
+        jobs_skipped: int,
+    ) -> None:
+        """写入 run_summary.json
+        
+        Args:
+            jobs: 任务列表
+            params: 参数字典
+            jobs_planned: 计划的任务数
+            jobs_analyzed: 分析的任务数
+            jobs_emitted: 生成片段的任务数
+            jobs_failed: 失败的任务列表
+            jobs_skipped: 跳过的任务数
+        """
+        if not jobs:
+            return
+        
+        # 确定输出目录
+        # 找到所有 jobs 的 out_dir 的共同父目录
+        out_dirs = [job.out_dir for job in jobs]
+        common_parent = out_dirs[0].parent
+        
+        # 如果所有 out_dir 都在同一个父目录下，使用该父目录
+        # 否则使用第一个 job 的 out_dir 的父目录
+        for out_dir in out_dirs[1:]:
+            try:
+                # 尝试找到共同父目录
+                if out_dir.parent != common_parent:
+                    # 如果不在同一个父目录，尝试找到更上层的共同目录
+                    common_parts = []
+                    parts1 = common_parent.parts
+                    parts2 = out_dir.parent.parts
+                    for p1, p2 in zip(parts1, parts2):
+                        if p1 == p2:
+                            common_parts.append(p1)
+                        else:
+                            break
+                    if common_parts:
+                        common_parent = Path(*common_parts)
+                    else:
+                        # 如果找不到共同目录，使用第一个 job 的 out_dir 的父目录
+                        common_parent = out_dirs[0].parent
+                        break
+            except Exception:
+                common_parent = out_dirs[0].parent
+                break
+        
+        # 如果 out_mode=out_root，且 out_dir 名称是 "seg"，则使用父目录的父目录
+        out_mode = params.get("out_mode", "in_place")
+        if out_mode == "out_root" and out_dirs[0].name == "seg":
+            summary_dir = common_parent.parent if common_parent.name != "seg" else common_parent
+        else:
+            summary_dir = common_parent
+        
+        # 计算 totals
+        speech_total_sec = 0.0
+        silences_total_sec = 0.0
+        
+        for job in jobs:
+            # 读取 seg_report.json 获取统计信息
+            report_path = job.out_dir / "seg_report.json"
+            if report_path.exists():
+                try:
+                    with open(report_path, "r", encoding="utf-8") as f:
+                        report_data = json.load(f)
+                    
+                    # 累加 speech_total_sec
+                    segments_data = report_data.get("segments", {})
+                    if isinstance(segments_data, dict):
+                        speech_total_sec += segments_data.get("speech_total_sec", 0.0)
+                    
+                    # 累加 silences_total_sec
+                    analysis_data = report_data.get("analysis", {})
+                    silence_data = analysis_data.get("silence", {})
+                    if isinstance(silence_data, dict):
+                        silences_total_sec += silence_data.get("silences_total_sec", 0.0)
+                except Exception:
+                    pass  # 读取失败，跳过
+        
+        # 构建 run_summary
+        finished_at = datetime.now().isoformat()
+        run_id = str(uuid.uuid4())
+        
+        summary = {
+            "run_id": run_id,
+            "started_at": self.started_at,
+            "finished_at": finished_at,
+            "cli_args": params,
+            "counts": {
+                "jobs_total": len(jobs),
+                "jobs_planned": jobs_planned,
+                "jobs_analyzed": jobs_analyzed,
+                "jobs_emitted": jobs_emitted,
+                "jobs_failed": len(jobs_failed),
+                "jobs_skipped": jobs_skipped,
+            },
+            "totals": {
+                "speech_total_sec": round(speech_total_sec, 3),
+                "silences_total_sec": round(silences_total_sec, 3),
+            },
+            "failures": jobs_failed,
+            "dry_run": self.dry_run,
+        }
+        
+        # 写入文件
+        summary_path = summary_dir / "run_summary.json"
+        try:
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+            logger.info(f"写入 run_summary.json: {summary_path}")
+        except Exception as e:
+            logger.warning(f"写入 run_summary.json 失败: {e}", exc_info=True)
 

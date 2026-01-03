@@ -179,6 +179,57 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="日志文件路径（可选）",
     )
+    segment_parser.add_argument(
+        "--validate-output",
+        action="store_true",
+        default=False,
+        help="生成 segments.jsonl 后立即验证输出（默认: False）",
+    )
+    
+    # validate 子命令
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="验证输出文件（segments.jsonl / silences.json / seg_report.json）",
+    )
+    validate_parser.add_argument(
+        "--in",
+        dest="input_path",
+        required=True,
+        help="输入路径：segments.jsonl 文件、目录或 workdir/out_root（必填）",
+    )
+    validate_parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help="严格模式：将 warnings 视为 errors（默认: False）",
+    )
+    validate_parser.add_argument(
+        "--max-errors",
+        type=int,
+        default=20,
+        help="最大错误数（达到后停止，默认: 20）",
+    )
+    validate_parser.add_argument(
+        "--pattern",
+        default="segments.jsonl",
+        help="目录扫描时的文件名模式（默认: segments.jsonl）",
+    )
+    validate_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="以 JSON 格式输出汇总（默认: False）",
+    )
+    validate_parser.add_argument(
+        "--log-level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help=f"日志级别（默认: {DEFAULT_LOG_LEVEL}）",
+    )
+    validate_parser.add_argument(
+        "--log-file",
+        default=None,
+        help="日志文件路径（可选）",
+    )
     
     return parser
 
@@ -215,6 +266,93 @@ def cmd_check_deps(args: argparse.Namespace) -> int:
                 "error": str(e),
             }
             print(json.dumps(error_report, ensure_ascii=False))
+        else:
+            print(f"错误: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    """执行 validate 子命令"""
+    from onepass_audioclean_seg.validate import validate_file_or_dir
+    
+    input_path = Path(args.input_path)
+    
+    try:
+        summary = validate_file_or_dir(
+            input_path=input_path,
+            pattern=args.pattern,
+            strict=args.strict,
+            max_errors=args.max_errors,
+        )
+        
+        if args.json:
+            # JSON 模式：只输出 JSON，不混入日志
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+        else:
+            # 文本模式：逐个文件输出 OK/FAIL，并在末尾输出汇总
+            for result in summary["results"]:
+                status = "OK" if result["ok"] else "FAIL"
+                path = result["path"]
+                errors_count = len(result["errors"])
+                warnings_count = len(result["warnings"])
+                
+                print(f"{status} {path} errors={errors_count} warnings={warnings_count}")
+                
+                # 输出错误和警告（限制数量）
+                if result["errors"]:
+                    for error in result["errors"][:5]:  # 最多显示 5 个错误
+                        print(f"  ERROR: {error}", file=sys.stderr)
+                    if len(result["errors"]) > 5:
+                        print(f"  ... 还有 {len(result['errors']) - 5} 个错误", file=sys.stderr)
+                
+                if result["warnings"]:
+                    for warning in result["warnings"][:5]:  # 最多显示 5 个警告
+                        print(f"  WARNING: {warning}", file=sys.stderr)
+                    if len(result["warnings"]) > 5:
+                        print(f"  ... 还有 {len(result['warnings']) - 5} 个警告", file=sys.stderr)
+            
+            # 输出汇总
+            print(f"\n汇总: checked={summary['checked_files']} "
+                  f"failed={summary['failed_files']} "
+                  f"errors={summary['errors']} "
+                  f"warnings={summary['warnings']}")
+        
+        # 根据结果返回退出码
+        if summary["ok"]:
+            return 0
+        elif summary["error_code"] == "violations":
+            return 2
+        else:
+            return 1
+    except FileNotFoundError as e:
+        if args.json:
+            error_report = {
+                "ok": False,
+                "error_code": "unexpected_error",
+                "checked_files": 0,
+                "failed_files": 0,
+                "warnings": 0,
+                "errors": 0,
+                "error": str(e),
+                "results": [],
+            }
+            print(json.dumps(error_report, ensure_ascii=False, indent=2))
+        else:
+            print(f"错误: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        if args.json:
+            error_report = {
+                "ok": False,
+                "error_code": "unexpected_error",
+                "checked_files": 0,
+                "failed_files": 0,
+                "warnings": 0,
+                "errors": 0,
+                "error": str(e),
+                "results": [],
+            }
+            print(json.dumps(error_report, ensure_ascii=False, indent=2))
         else:
             print(f"错误: {e}", file=sys.stderr)
         return 1
@@ -279,6 +417,7 @@ def cmd_segment(args: argparse.Namespace) -> int:
         "dry_run": args.dry_run,
         "analyze": args.analyze,
         "emit_segments": args.emit_segments,
+        "validate_output": getattr(args, "validate_output", False),
     }
     
     try:
@@ -293,6 +432,7 @@ def cmd_segment(args: argparse.Namespace) -> int:
             analyze=args.analyze,
             emit_segments=args.emit_segments,
             silence_threshold_db=args.silence_threshold_db,
+            validate_output=getattr(args, "validate_output", False),
         )
         executed_count = planner.plan_and_execute(jobs, params)
         
@@ -329,6 +469,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_check_deps(args)
         elif args.command == "segment":
             return cmd_segment(args)
+        elif args.command == "validate":
+            return cmd_validate(args)
         else:
             parser.print_help()
             return 2

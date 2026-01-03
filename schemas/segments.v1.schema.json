@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "segments.jsonl v1",
+  "description": "语音片段列表（JSONL 格式，每行一个片段对象）",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "片段 ID，格式为 seg_000001, seg_000002, ...",
+      "pattern": "^seg_\\d{6}$"
+    },
+    "start_sec": {
+      "type": "number",
+      "description": "片段开始时间（秒），round(3)，>= 0",
+      "minimum": 0
+    },
+    "end_sec": {
+      "type": "number",
+      "description": "片段结束时间（秒），round(3)，> start_sec",
+      "minimum": 0
+    },
+    "duration_sec": {
+      "type": "number",
+      "description": "片段时长（秒），round(3)，约等于 (end_sec - start_sec)，误差 <= 0.002",
+      "minimum": 0
+    },
+    "source_audio": {
+      "type": "string",
+      "description": "源音频文件路径（绝对路径）"
+    },
+    "pre_silence_sec": {
+      "type": "number",
+      "description": "该片段前一个静音区间的时长（秒），round(3)，>= 0，可选",
+      "minimum": 0,
+      "default": 0.0
+    },
+    "post_silence_sec": {
+      "type": "number",
+      "description": "该片段后一个静音区间的时长（秒），round(3)，>= 0，可选",
+      "minimum": 0,
+      "default": 0.0
+    },
+    "is_speech": {
+      "type": "boolean",
+      "description": "是否为语音片段，可选",
+      "default": true
+    },
+    "strategy": {
+      "type": "string",
+      "description": "分段策略，可选",
+      "enum": ["silence", "energy", "vad"],
+      "default": "silence"
+    },
+    "rms": {
+      "type": "number",
+      "description": "RMS 值（归一化到 [0, 1]），round(6)，可选",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "energy_db": {
+      "type": "number",
+      "description": "能量 dB 值，round(2)，可选"
+    },
+    "notes": {
+      "type": "object",
+      "description": "额外信息（如 split_reason, merged_from 等），可选",
+      "additionalProperties": true
+    }
+  },
+  "required": ["id", "start_sec", "end_sec", "duration_sec", "source_audio"]
+}
+

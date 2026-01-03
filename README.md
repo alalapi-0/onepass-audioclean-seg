@@ -247,7 +247,74 @@ audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --emi
 - **R4**: 实现了 `silencedetect` 静音分析功能，可以输出静音区间中间文件
 - **R5**: 实现了从静音区间生成语音片段的功能，可以输出 `segments.jsonl`
 - **R6**: 实现了 MVP 规整增强（merge/split）+ 能量特征 + 可选切片导出
+- **R7**: 协议固化与输出验证（validate）+ 批处理汇总（run_summary.json）
 - 后续版本将实现更复杂的分段策略（`energy`、`vad`）和低能量点切分功能
+
+#### R7 新功能：输出验证与批处理汇总
+
+R7 版本引入了输出验证功能和批处理汇总报告。
+
+**输出验证**:
+
+```bash
+# 验证单个 segments.jsonl 文件
+audioclean-seg validate --in segments.jsonl
+
+# 验证目录（递归扫描所有 segments.jsonl）
+audioclean-seg validate --in out_root/
+
+# 严格模式（将 warnings 视为 errors）
+audioclean-seg validate --in out_root/ --strict
+
+# JSON 格式输出
+audioclean-seg validate --in out_root/ --json
+```
+
+`validate` 命令会检查：
+- `segments.jsonl` 的格式和字段完整性
+- 数值约束（start_sec >= 0, end_sec > start_sec, duration_sec 一致性等）
+- ID 连续性和格式（seg_000001, seg_000002, ...）
+- 片段排序和重叠检查
+- 与 `seg_report.json` 和 `silences.json` 的一致性
+
+**--validate-output 选项**:
+
+在 `segment` 命令中，可以使用 `--validate-output` 选项在生成 `segments.jsonl` 后立即验证：
+
+```bash
+audioclean-seg segment \
+    --in audio.wav \
+    --out output_dir \
+    --emit-segments \
+    --validate-output
+```
+
+如果验证失败，该 job 会被标记为 FAIL，但会继续处理其他 job。
+
+**run_summary.json**:
+
+每次运行 `segment` 命令（包括 dry-run）后，会在输出根目录下生成 `run_summary.json`，包含：
+
+- `run_id`: 运行唯一标识符
+- `started_at` / `finished_at`: 开始和结束时间
+- `cli_args`: 完整参数快照
+- `counts`: 任务统计（jobs_total, jobs_planned, jobs_analyzed, jobs_emitted, jobs_failed, jobs_skipped）
+- `totals`: 总时长统计（speech_total_sec, silences_total_sec）
+- `failures`: 失败任务列表
+- `dry_run`: 是否为 dry-run 模式
+
+**协议文档（schemas/）**:
+
+仓库中的 `schemas/` 目录包含三个 JSON Schema 文件（仅作为文档，运行时不需要 jsonschema 库）：
+
+- `segments.v1.schema.json`: segments.jsonl 格式定义
+- `silences.v1.schema.json`: silences.json 格式定义
+- `seg_report.v1.schema.json`: seg_report.json 格式定义
+
+这些 schema 文件用于：
+- 协议文档和参考
+- 后续版本兼容性保证（v1 固定后，新增字段只能作为 optional）
+- 外部工具集成参考
 
 ### 全局选项
 
@@ -273,4 +340,12 @@ pytest tests/test_cli_help.py -v
   - 输出路径规划（in_place/out_root 模式）
   - dry-run 计划输出
   - 最小 seg_report.json 生成
-- 后续版本将实现真实的分段算法
+- **R4**: 实现 `silencedetect` 静音分析功能
+- **R5**: 实现从静音区间生成语音片段的功能
+- **R6**: 实现 MVP 规整增强（merge/split）+ 能量特征 + 可选切片导出
+- **R7**: 协议固化与输出验证（validate）+ 批处理汇总（run_summary.json）
+  - 新增 `validate` 子命令，支持离线验证输出文件
+  - `segment` 命令新增 `--validate-output` 选项
+  - 自动生成 `run_summary.json` 批处理汇总报告
+  - 新增 `schemas/` 目录，包含协议文档（JSON Schema）
+- 后续版本将实现更复杂的分段策略（`energy`、`vad`）和低能量点切分功能

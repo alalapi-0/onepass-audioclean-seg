@@ -1,0 +1,169 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "seg_report.json v1",
+  "description": "分段报告（JSON 格式）",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "报告版本（如 R3, R4, R5, R6）"
+    },
+    "created_at": {
+      "type": "string",
+      "description": "创建时间（ISO 8601 格式）",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "description": "更新时间（ISO 8601 格式），可选",
+      "format": "date-time"
+    },
+    "versions": {
+      "type": "object",
+      "description": "版本信息",
+      "properties": {
+        "onepass_audioclean_seg": {
+          "type": "string",
+          "description": "onepass_audioclean_seg 版本号"
+        }
+      },
+      "additionalProperties": true
+    },
+    "planned": {
+      "type": "boolean",
+      "description": "是否已计划（R3 阶段）",
+      "default": true
+    },
+    "params": {
+      "type": "object",
+      "description": "分段参数",
+      "additionalProperties": true
+    },
+    "audio_path": {
+      "type": "string",
+      "description": "音频文件路径（绝对路径）"
+    },
+    "meta_path": {
+      "type": ["string", "null"],
+      "description": "meta.json 路径（可选）"
+    },
+    "analysis": {
+      "type": "object",
+      "description": "分析结果（R4 阶段）",
+      "properties": {
+        "silence": {
+          "type": "object",
+          "description": "静音分析结果",
+          "properties": {
+            "silences_count": {
+              "type": "integer",
+              "description": "静音区间数量",
+              "minimum": 0
+            },
+            "silences_total_sec": {
+              "type": "number",
+              "description": "静音总时长（秒），round(3)",
+              "minimum": 0
+            },
+            "threshold_db": {
+              "type": "number",
+              "description": "静音检测阈值（dB）"
+            },
+            "min_silence_sec": {
+              "type": "number",
+              "description": "最小静音时长（秒）",
+              "minimum": 0
+            },
+            "duration_sec": {
+              "type": ["number", "null"],
+              "description": "音频总时长（秒），round(3)"
+            }
+          },
+          "required": ["silences_count", "silences_total_sec", "threshold_db", "min_silence_sec"]
+        }
+      },
+      "additionalProperties": true
+    },
+    "segments": {
+      "type": "object",
+      "description": "片段统计信息（R5/R6 阶段）",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "description": "片段数量",
+          "minimum": 0
+        },
+        "speech_total_sec": {
+          "type": "number",
+          "description": "语音总时长（秒），round(3)",
+          "minimum": 0
+        },
+        "min_seg_sec": {
+          "type": "number",
+          "description": "最小片段时长（秒）",
+          "minimum": 0
+        },
+        "max_seg_sec": {
+          "type": "number",
+          "description": "最大片段时长（秒）",
+          "minimum": 0
+        },
+        "pad_sec": {
+          "type": "number",
+          "description": "片段前后填充时长（秒）",
+          "minimum": 0
+        },
+        "merge_overlaps": {
+          "type": "boolean",
+          "description": "是否合并重叠段"
+        },
+        "min_merge": {
+          "type": "boolean",
+          "description": "是否通过合并强制最小时长"
+        },
+        "max_split": {
+          "type": "string",
+          "description": "超长段切分策略（如 equal）"
+        },
+        "rms_computed": {
+          "type": "boolean",
+          "description": "是否计算了 RMS"
+        },
+        "strategy": {
+          "type": "string",
+          "description": "分段策略",
+          "enum": ["silence", "energy", "vad"]
+        },
+        "warnings": {
+          "type": "array",
+          "description": "警告信息列表，可选",
+          "items": {
+            "type": "string"
+          }
+        },
+        "outputs": {
+          "type": "object",
+          "description": "输出文件路径",
+          "properties": {
+            "segments_jsonl": {
+              "type": "string",
+              "description": "segments.jsonl 路径（绝对路径）"
+            },
+            "silences_json": {
+              "type": "string",
+              "description": "silences.json 路径（绝对路径）"
+            },
+            "segments_wav_dir": {
+              "type": ["string", "null"],
+              "description": "segments WAV 目录路径（可选）"
+            }
+          },
+          "required": ["segments_jsonl", "silences_json"]
+        }
+      },
+      "required": ["count", "speech_total_sec", "strategy"]
+    }
+  },
+  "required": ["version", "created_at", "versions", "params", "audio_path"]
+}
+
