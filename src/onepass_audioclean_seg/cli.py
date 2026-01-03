@@ -71,19 +71,36 @@ def create_parser() -> argparse.ArgumentParser:
     # segment 子命令
     segment_parser = subparsers.add_parser(
         "segment",
-        help="将音频分段（R1 占位实现，仅打印计划）",
+        help="将音频分段（R3：输入解析与计划）",
     )
     segment_parser.add_argument(
         "--in",
         dest="input_path",
         required=True,
-        help="输入音频文件路径（必填）",
+        help="输入路径：单个音频文件、workdir、批处理根目录或 manifest.jsonl（必填）",
     )
     segment_parser.add_argument(
         "--out",
         dest="output_dir",
         required=True,
-        help="输出目录路径（必填）",
+        help="输出根目录路径（必填）",
+    )
+    segment_parser.add_argument(
+        "--pattern",
+        default="audio.wav",
+        help="扫描根目录时使用的文件名模式（默认: audio.wav）",
+    )
+    segment_parser.add_argument(
+        "--out-mode",
+        choices=["in_place", "out_root"],
+        default="in_place",
+        help="输出模式：in_place（输出到 workdir/seg）或 out_root（输出到 out_root 下镜像目录，默认: in_place）",
+    )
+    segment_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="dry-run 模式：只打印计划，不写入文件（默认: False）",
     )
     segment_parser.add_argument(
         "--strategy",
@@ -185,30 +202,46 @@ def cmd_check_deps(args: argparse.Namespace) -> int:
 
 
 def cmd_segment(args: argparse.Namespace) -> int:
-    """执行 segment 子命令（R1 仅打印计划）"""
+    """执行 segment 子命令（R3：输入解析与计划）"""
+    from onepass_audioclean_seg.pipeline.resolver import InputResolver
+    from onepass_audioclean_seg.pipeline.planner import SegmentPlanner
+    
     input_path = Path(args.input_path)
     output_dir = Path(args.output_dir)
     
-    # 打印计划（dry-run 风格）
-    print("=" * 60)
-    print("PLAN: 音频分段计划（R1 占位实现，不会实际处理）")
-    print("=" * 60)
-    print(f"输入文件: {input_path}")
-    print(f"输出目录: {output_dir}")
-    print(f"分段策略: {args.strategy}")
-    print(f"参数配置:")
-    print(f"  - 最小静音时长: {args.min_silence_sec} 秒")
-    print(f"  - 最小片段时长: {args.min_seg_sec} 秒")
-    print(f"  - 最大片段时长: {args.max_seg_sec} 秒")
-    print(f"  - 片段填充时长: {args.pad_sec} 秒")
-    print(f"  - 输出 WAV: {args.emit_wav}")
-    print(f"  - 并行任务数: {args.jobs}")
-    print(f"  - 覆盖已存在: {args.overwrite}")
-    print("=" * 60)
-    print("注意: R1 版本仅进行参数解析和计划打印，不会实际执行分段操作。")
-    print("=" * 60)
+    # 构建参数字典（用于写入报告）
+    params = {
+        "strategy": args.strategy,
+        "min_silence_sec": args.min_silence_sec,
+        "min_seg_sec": args.min_seg_sec,
+        "max_seg_sec": args.max_seg_sec,
+        "pad_sec": args.pad_sec,
+        "emit_wav": args.emit_wav,
+        "jobs": args.jobs,
+        "overwrite": args.overwrite,
+        "pattern": args.pattern,
+        "out_mode": args.out_mode,
+        "dry_run": args.dry_run,
+    }
     
-    return 0
+    try:
+        # 解析输入
+        resolver = InputResolver(pattern=args.pattern)
+        jobs = resolver.resolve(input_path, output_dir, args.out_mode)
+        
+        # 规划并执行（或 dry-run）
+        planner = SegmentPlanner(dry_run=args.dry_run, overwrite=args.overwrite)
+        executed_count = planner.plan_and_execute(jobs, params)
+        
+        return 0
+    except FileNotFoundError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"错误: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:

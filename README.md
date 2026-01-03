@@ -58,9 +58,34 @@ audioclean-seg check-deps --verbose
 
 ### 音频分段
 
+#### 输入类型（R3）
+
+`segment` 命令支持多种输入形态：
+
+- **单个音频文件** (`--in audio.wav`): 直接指定音频文件路径
+- **工作目录** (`--in workdir/`): 包含 `audio.wav` 的目录（可选 `meta.json`）
+- **批处理根目录** (`--in root_dir/`): 递归扫描所有 `audio.wav` 文件
+- **清单文件** (`--in manifest.jsonl`): Repo1 输出的清单文件，自动解析成功项
+
+#### 输出模式（R3）
+
+- `--out-mode in_place`（默认）: 如果 job 有 workdir，输出到 `workdir/seg`；否则输出到 `out_root/<name>/seg`
+- `--out-mode out_root`: 全部输出到 `out_root` 下镜像目录（即使有 workdir 也不写回）
+
+#### 基本用法
+
 ```bash
-# 基本用法（R1 仅打印计划，不实际处理）
-audioclean-seg segment --in audio.wav --out output_dir
+# 单个音频文件（dry-run 模式，只打印计划）
+audioclean-seg segment --in audio.wav --out output_dir --dry-run
+
+# 工作目录（in_place 模式，输出到 workdir/seg）
+audioclean-seg segment --in workdir/ --out output_dir --out-mode in_place
+
+# 批处理根目录（out_root 模式，镜像目录结构）
+audioclean-seg segment --in root_dir/ --out output_dir --out-mode out_root --dry-run
+
+# manifest.jsonl 文件
+audioclean-seg segment --in manifest.jsonl --out output_dir --dry-run
 
 # 指定分段策略和参数
 audioclean-seg segment \
@@ -73,7 +98,8 @@ audioclean-seg segment \
     --pad-sec 0.1 \
     --emit-wav \
     --jobs 4 \
-    --overwrite
+    --overwrite \
+    --dry-run
 
 # 使用日志选项
 audioclean-seg segment \
@@ -83,7 +109,13 @@ audioclean-seg segment \
     --log-file segment.log
 ```
 
-**注意**: R1 版本仅完成骨架与 CLI，占位实现。后续版本将实现真实的 `silencedetect`、`energy`、`vad` 分段功能。
+#### R3 新参数
+
+- `--pattern`: 扫描根目录时使用的文件名模式（默认: `audio.wav`）
+- `--out-mode`: 输出模式，`in_place` 或 `out_root`（默认: `in_place`）
+- `--dry-run`: dry-run 模式，只打印计划不写入文件（默认: `False`）
+
+**注意**: R3 版本实现输入解析与计划输出，会生成 `seg_report.json` 但不会实际分段。后续版本将实现真实的 `silencedetect`、`energy`、`vad` 分段功能。
 
 ### 全局选项
 
@@ -104,4 +136,9 @@ pytest tests/test_cli_help.py -v
 
 - **R1**: 项目骨架完成，CLI 可运行，占位实现
 - **R2**: 实现真实的依赖检查（ffmpeg/ffprobe/silencedetect）
+- **R3**: 输入解析与 Repo1 契约适配层
+  - 支持多种输入形态（file/workdir/root/manifest）
+  - 输出路径规划（in_place/out_root 模式）
+  - dry-run 计划输出
+  - 最小 seg_report.json 生成
 - 后续版本将实现真实的分段算法
