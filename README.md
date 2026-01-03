@@ -131,6 +131,95 @@ audioclean-seg segment --in workdir --out out_root --out-mode out_root --auto-st
 - 噪声底高/静音不明显时，启用 `--auto-strategy` 可自动降级到更合适的策略
 - 不确定使用哪个策略时，让系统自动选择
 
+#### R11 新功能：配置文件支持
+
+R11 版本新增了配置文件支持，避免每次敲一堆 CLI 参数：
+
+**配置文件格式**（支持 JSON 和 YAML）：
+
+```json
+{
+  "strategy": {
+    "name": "energy",
+    "auto": {
+      "enabled": false,
+      "order": ["silence", "vad", "energy"],
+      "min_segments": 2,
+      "min_speech_total_sec": 3.0
+    }
+  },
+  "silence": {
+    "threshold_db": -35.0,
+    "min_silence_sec": 0.35
+  },
+  "energy": {
+    "threshold_rms": 0.02,
+    "frame_ms": 30.0,
+    "hop_ms": 10.0,
+    "smooth_ms": 100.0,
+    "min_speech_sec": 0.20
+  },
+  "vad": {
+    "aggressiveness": 2,
+    "frame_ms": 30,
+    "sample_rate": 16000,
+    "min_speech_sec": 0.20
+  },
+  "postprocess": {
+    "min_seg_sec": 1.0,
+    "max_seg_sec": 25.0,
+    "pad_sec": 0.1
+  },
+  "exports": {
+    "timeline": false,
+    "csv": false,
+    "mask": "none",
+    "mask_bin_ms": 50.0
+  },
+  "runtime": {
+    "jobs": 1,
+    "overwrite": false,
+    "out_mode": "in_place"
+  },
+  "validate": {
+    "enabled": false,
+    "strict": false
+  }
+}
+```
+
+**使用配置文件**：
+
+```bash
+# 使用 JSON 配置文件
+audioclean-seg segment --config config.json --in audio.wav --out output_dir --emit-segments
+
+# 使用 YAML 配置文件（需要安装 pyyaml: pip install -e ".[yaml]"）
+audioclean-seg segment --config config.yaml --in audio.wav --out output_dir --emit-segments
+
+# 使用 --set 覆盖配置项（可多次使用）
+audioclean-seg segment \
+    --config config.json \
+    --set strategy.name=energy \
+    --set postprocess.min_seg_sec=2.0 \
+    --in audio.wav \
+    --out output_dir \
+    --emit-segments
+
+# 打印合并后的最终配置并退出（不执行分段）
+audioclean-seg segment --config config.json --dump-effective-config
+```
+
+**配置合并优先级**（从低到高）：
+1. 默认值（defaults）
+2. 配置文件（config file）
+3. `--set` 覆盖
+4. 显式 CLI 参数（命令行直接提供的参数）
+
+**YAML 支持**：
+- YAML 为可选依赖，需要安装：`pip install -e ".[yaml]"`
+- 如果使用 `.yaml` 或 `.yml` 配置文件但未安装 pyyaml，会返回退出码 2 并提示安装
+
 #### 基本用法
 
 ```bash
@@ -401,7 +490,8 @@ Repo6 可以直接加载 `timeline.json` + `mask.json` 做三轨道渲染的 Tra
 - **R5**: 实现了从静音区间生成语音片段的功能，可以输出 `segments.jsonl`
 - **R6**: 实现了 MVP 规整增强（merge/split）+ 能量特征 + 可选切片导出
 - **R7**: 协议固化与输出验证（validate）+ 批处理汇总（run_summary.json）
-- 后续版本将实现更复杂的分段策略（`energy`、`vad`）和低能量点切分功能
+- **R8-R10**: 实现了更复杂的分段策略（`energy`、`vad`）和可视化友好输出
+- **R11**: 配置系统 + 可复现实验快照 + 回归基准（golden）+ 错误分级与退出码规范
 
 #### R7 新功能：输出验证与批处理汇总
 
@@ -456,6 +546,38 @@ audioclean-seg segment \
 - `failures`: 失败任务列表
 - `dry_run`: 是否为 dry-run 模式
 
+**run_manifest.json**（R11 新增）:
+
+每次运行 `segment` 命令（非 dry-run）后，会在输出根目录下生成 `run_manifest.json`，包含可复现实验快照：
+
+- `tool`: 工具名称（"onepass-audioclean-seg"）
+- `version`: 包版本号
+- `git`: Git commit（可选，从环境变量 GIT_COMMIT 或 .git 读取）
+- `started_at` / `finished_at`: 开始和结束时间
+- `command`: 完整命令行参数（argv）
+- `effective_config`: 合并后的最终配置（与 `--dump-effective-config` 一致）
+- `environment`: 环境信息
+  - `python_version`: Python 版本
+  - `platform`: 平台信息
+  - `deps`: 依赖版本（ffmpeg_version, ffprobe_version, webrtcvad_version, pyyaml_version）
+- `jobs`: 任务列表，每个任务包含：
+  - `job_id`: 任务 ID
+  - `audio_path`: 音频文件路径
+  - `out_dir`: 输出目录
+  - `status`: 状态（analyzed, emitted, failed, skipped 等）
+  - `chosen_strategy`: 使用的策略
+  - `segments_count`: 片段数量
+  - `speech_total_sec`: 总语音时长
+  - `errors_count` / `warnings_count`: 错误/警告数量
+
+**seg_report.json 元数据**（R11 新增）:
+
+每个 job 的 `seg_report.json` 现在包含：
+
+- `tool`: 工具信息（name, version）
+- `config_hash`: 配置哈希值（用于可复现性）
+- `audio_fingerprint`: 音频指纹（轻量级标识，格式：sha256[:16]:sr x ch:frames）
+
 **协议文档（schemas/）**:
 
 仓库中的 `schemas/` 目录包含三个 JSON Schema 文件（仅作为文档，运行时不需要 jsonschema 库）：
@@ -474,6 +596,39 @@ audioclean-seg segment \
 - `--log-level`: 日志级别（DEBUG, INFO, WARNING, ERROR, CRITICAL），默认 INFO
 - `--log-file`: 日志文件路径（可选）
 
+### 错误退出码（R11）
+
+R11 版本统一了错误类型与退出码规范，便于流水线自动化：
+
+- **退出码 0**: 成功
+- **退出码 1**: 运行时处理错误（分析失败、生成片段失败等）
+- **退出码 2**: 用户参数错误/依赖缺失/输入文件不存在/配置错误/验证失败
+
+**错误类型**：
+
+- `ConfigError`: 配置文件格式错误、无法解析等 -> exit 2
+- `ArgError`: CLI 参数无效、冲突等 -> exit 2
+- `DependencyMissingError`: 必需依赖未安装（如 pyyaml 缺失但使用了 .yaml 配置）-> exit 2
+- `InputNotFoundError`: 输入文件不存在 -> exit 2
+- `RuntimeProcessingError`: 运行时处理错误 -> exit 1
+- `ValidationError`: validate 命令发现的问题 -> exit 2
+
+**示例**：
+
+```bash
+# 输入文件不存在 -> exit 2
+audioclean-seg segment --in /nonexistent/audio.wav --out output_dir
+echo $?  # 输出 2
+
+# 配置文件不存在 -> exit 2
+audioclean-seg segment --config /nonexistent/config.json --in audio.wav --out output_dir
+echo $?  # 输出 2
+
+# YAML 配置但 pyyaml 未安装 -> exit 2
+audioclean-seg segment --config config.yaml --in audio.wav --out output_dir
+echo $?  # 输出 2
+```
+
 ## 开发
 
 ```bash
@@ -482,7 +637,37 @@ pytest -q
 
 # 运行单个测试
 pytest tests/test_cli_help.py -v
+
+# 运行 golden 测试（R11）
+pytest tests/test_golden_segments_output.py -v
 ```
+
+### 回归基准测试（Golden Tests，R11）
+
+R11 版本引入了回归基准测试，确保给定固定输入与配置时，输出 segments.jsonl 必须稳定。
+
+**Golden 测试目录结构**：
+
+```
+tests/golden/
+├── config.json              # 固定配置
+├── expected_segments.jsonl  # 期望输出（文本文件，可提交）
+└── assets/                  # 测试音频文件（由测试运行时生成）
+```
+
+**更新期望输出**：
+
+如果算法改进导致输出变化，需要更新 `tests/golden/expected_segments.jsonl`：
+
+1. 运行 golden 测试（会失败并打印实际输出）
+2. 将实际输出复制到 `tests/golden/expected_segments.jsonl`
+3. 重新运行测试验证
+
+**Golden 测试比较规则**：
+
+- 只比较关键字段：`id`, `start_sec`, `end_sec`, `duration_sec`, `flags`, `strategy`
+- 不比较 `rms` 和 `energy_db`（浮点值可能有小误差）
+- `source_audio` 路径会被归一化为 `<AUDIO>`
 
 ## 版本说明
 
@@ -508,3 +693,8 @@ pytest tests/test_cli_help.py -v
   - 导出 timeline.json、segments.csv、mask.json 等可视化友好文件
   - 新增 `summarize` 子命令，快速浏览 segments.jsonl 摘要
   - 在 seg_report.json 和 run_summary.json 中记录 exports 统计
+- **R11**: 配置系统 + 可复现实验快照 + 回归基准（golden）+ 错误分级与退出码规范
+  - 支持配置文件（JSON/YAML），避免每次敲一堆 CLI 参数
+  - 每次运行写 `run_manifest.json`（参数快照 + 代码版本 + 环境依赖版本），保证可复现
+  - 引入 golden 基准测试：给定固定输入与配置，输出 segments.jsonl 必须稳定
+  - 错误分级：用户参数错误/依赖缺失/运行时失败要有一致退出码与清晰信息

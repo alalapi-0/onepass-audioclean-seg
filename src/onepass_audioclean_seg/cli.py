@@ -87,6 +87,23 @@ def create_parser() -> argparse.ArgumentParser:
         "segment",
         help="将音频分段（R3：输入解析与计划）",
     )
+    # R11: 配置相关参数
+    segment_parser.add_argument(
+        "--config",
+        type=str,
+        help="配置文件路径（支持 .json 或 .yaml/.yml）",
+    )
+    segment_parser.add_argument(
+        "--set",
+        action="append",
+        dest="set_overrides",
+        help="覆盖配置项（可多次使用，格式：key=value，支持点号路径，如 strategy.auto.enabled=true）",
+    )
+    segment_parser.add_argument(
+        "--dump-effective-config",
+        action="store_true",
+        help="打印合并后的最终配置（JSON 格式）并退出",
+    )
     segment_parser.add_argument(
         "--in",
         dest="input_path",
@@ -570,42 +587,151 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_segment(args: argparse.Namespace) -> int:
-    """执行 segment 子命令（R3：输入解析与计划；R4：静音分析；R5：生成片段）"""
+    """执行 segment 子命令（R3：输入解析与计划；R4：静音分析；R5：生成片段；R11：配置支持）"""
+    from onepass_audioclean_seg.config import (
+        compute_config_hash,
+        config_to_cli_params,
+        get_default_config,
+        load_config_file,
+        merge_configs,
+        set_nested_value,
+    )
+    from onepass_audioclean_seg.errors import (
+        ArgError,
+        ConfigError,
+        DependencyMissingError,
+        InputNotFoundError,
+    )
     from onepass_audioclean_seg.pipeline.resolver import InputResolver
     from onepass_audioclean_seg.pipeline.planner import SegmentPlanner
     
+    # R11: 处理配置
+    defaults = get_default_config()
+    file_config = None
+    set_overrides = {}
+    
+    # 加载配置文件
+    if args.config:
+        try:
+            file_config = load_config_file(Path(args.config))
+        except ConfigError as e:
+            print(f"错误: {e}", file=sys.stderr)
+            return 2
+        except DependencyMissingError as e:
+            print(f"错误: {e}", file=sys.stderr)
+            return 2
+    
+    # 解析 --set 覆盖
+    if args.set_overrides:
+        for override in args.set_overrides:
+            if "=" not in override:
+                print(f"错误: --set 格式错误，应为 key=value: {override}", file=sys.stderr)
+                return 2
+            key, value = override.split("=", 1)
+            set_overrides[key] = value
+    
+    # 合并配置
+    effective_config = merge_configs(defaults, file_config, set_overrides)
+    
+    # R11: 如果 --dump-effective-config，打印配置并退出
+    if args.dump_effective_config:
+        print(json.dumps(effective_config, ensure_ascii=False, indent=2))
+        return 0
+    
+    # 将配置转换为 CLI 参数（作为基础）
+    config_params = config_to_cli_params(effective_config)
+    
+    # 检测显式 CLI 参数（使用 argparse.SUPPRESS 或检查 sys.argv）
+    # 为了简化，我们检查 args 中哪些参数不是默认值，或者检查 sys.argv
+    explicit_cli_params = {}
+    
+    # 检查每个可能的 CLI 参数是否在 sys.argv 中显式提供
+    cli_arg_map = {
+        "strategy": "--strategy",
+        "min_silence_sec": "--min-silence-sec",
+        "silence_threshold_db": "--silence-threshold-db",
+        "energy_frame_ms": "--energy-frame-ms",
+        "energy_hop_ms": "--energy-hop-ms",
+        "energy_smooth_ms": "--energy-smooth-ms",
+        "energy_threshold_rms": "--energy-threshold-rms",
+        "energy_min_speech_sec": "--energy-min-speech-sec",
+        "vad_aggressiveness": "--vad-aggressiveness",
+        "vad_frame_ms": "--vad-frame-ms",
+        "vad_sample_rate": "--vad-sample-rate",
+        "vad_min_speech_sec": "--vad-min-speech-sec",
+        "auto_strategy": "--auto-strategy",
+        "auto_strategy_order": "--auto-strategy-order",
+        "auto_strategy_min_segments": "--auto-strategy-min-segments",
+        "auto_strategy_min_speech_total_sec": "--auto-strategy-min-speech-total-sec",
+        "min_seg_sec": "--min-seg-sec",
+        "max_seg_sec": "--max-seg-sec",
+        "pad_sec": "--pad-sec",
+        "emit_wav": "--emit-wav",
+        "jobs": "--jobs",
+        "overwrite": "--overwrite",
+        "out_mode": "--out-mode",
+        "pattern": "--pattern",
+        "analyze": "--analyze",
+        "emit_segments": "--emit-segments",
+        "validate_output": "--validate-output",
+        "export_timeline": "--export-timeline",
+        "export_csv": "--export-csv",
+        "export_mask": "--export-mask",
+        "mask_bin_ms": "--mask-bin-ms",
+    }
+    
+    # 检查 sys.argv 中是否有显式参数
+    argv_set = set(sys.argv)
+    for param_key, arg_name in cli_arg_map.items():
+        if arg_name in argv_set:
+            # 从 args 获取值
+            attr_name = param_key.replace("-", "_")
+            if hasattr(args, attr_name):
+                explicit_cli_params[param_key] = getattr(args, attr_name)
+    
+    # 合并：config_params < explicit_cli_params
+    final_params = config_params.copy()
+    final_params.update(explicit_cli_params)
+    
+    # 添加一些必须从 args 获取的参数（即使不在 config 中）
     input_path = Path(args.input_path)
     output_dir = Path(args.output_dir)
+    final_params["pattern"] = getattr(args, "pattern", "audio.wav")
+    final_params["dry_run"] = getattr(args, "dry_run", False)
+    final_params["analyze"] = getattr(args, "analyze", False)
+    final_params["emit_segments"] = getattr(args, "emit_segments", False)
+    final_params["emit_wav"] = getattr(args, "emit_wav", False)
+    final_params["low_energy_rms_threshold"] = getattr(args, "low_energy_rms_threshold", 0.01)
     
     # 检查 --analyze 和 --dry-run 的冲突
-    if args.analyze and args.dry_run:
+    if final_params["analyze"] and final_params["dry_run"]:
         print("错误: --analyze 需要关闭 --dry-run", file=sys.stderr)
         return 2
     
     # 检查 --emit-segments 和 --dry-run 的冲突
-    if args.emit_segments and args.dry_run:
+    if final_params["emit_segments"] and final_params["dry_run"]:
         print("错误: --emit-segments 需要关闭 --dry-run", file=sys.stderr)
         return 2
     
     # 参数校验
-    if args.pad_sec < 0:
-        print(f"错误: --pad-sec 必须 >= 0，当前值: {args.pad_sec}", file=sys.stderr)
+    if final_params["pad_sec"] < 0:
+        print(f"错误: --pad-sec 必须 >= 0，当前值: {final_params['pad_sec']}", file=sys.stderr)
         return 2
     
-    if args.min_seg_sec <= 0:
-        print(f"错误: --min-seg-sec 必须 > 0，当前值: {args.min_seg_sec}", file=sys.stderr)
+    if final_params["min_seg_sec"] <= 0:
+        print(f"错误: --min-seg-sec 必须 > 0，当前值: {final_params['min_seg_sec']}", file=sys.stderr)
         return 2
     
-    if args.min_silence_sec <= 0:
-        print(f"错误: --min-silence-sec 必须 > 0，当前值: {args.min_silence_sec}", file=sys.stderr)
+    if final_params["min_silence_sec"] <= 0:
+        print(f"错误: --min-silence-sec 必须 > 0，当前值: {final_params['min_silence_sec']}", file=sys.stderr)
         return 2
     
-    if args.max_seg_sec < args.min_seg_sec:
-        print(f"错误: --max-seg-sec ({args.max_seg_sec}) 必须 >= --min-seg-sec ({args.min_seg_sec})", file=sys.stderr)
+    if final_params["max_seg_sec"] < final_params["min_seg_sec"]:
+        print(f"错误: --max-seg-sec ({final_params['max_seg_sec']}) 必须 >= --min-seg-sec ({final_params['min_seg_sec']})", file=sys.stderr)
         return 2
     
     # 检查 ffmpeg 是否存在（如果使用 silence 策略）
-    if args.strategy == "silence":
+    if final_params["strategy"] == "silence":
         from onepass_audioclean_seg.audio.ffmpeg import which
         ffmpeg_path = which("ffmpeg")
         if ffmpeg_path is None:
@@ -613,7 +739,7 @@ def cmd_segment(args: argparse.Namespace) -> int:
             return 1
     
     # 检查 webrtcvad 是否存在（如果使用 vad 策略）
-    if args.strategy == "vad":
+    if final_params["strategy"] == "vad":
         try:
             import webrtcvad
         except ImportError:
@@ -621,71 +747,47 @@ def cmd_segment(args: argparse.Namespace) -> int:
             print("提示: 请运行 pip install -e \".[vad]\" 或 pip install webrtcvad>=2.0.10", file=sys.stderr)
             return 2
     
-    # 构建参数字典（用于写入报告）
-    params = {
-        "strategy": args.strategy,
-        "min_silence_sec": args.min_silence_sec,
-        "silence_threshold_db": args.silence_threshold_db,
-        "energy_frame_ms": args.energy_frame_ms,
-        "energy_hop_ms": args.energy_hop_ms,
-        "energy_smooth_ms": args.energy_smooth_ms,
-        "energy_threshold_rms": args.energy_threshold_rms,
-        "energy_min_speech_sec": args.energy_min_speech_sec,
-        "vad_aggressiveness": args.vad_aggressiveness,
-        "vad_frame_ms": args.vad_frame_ms,
-        "vad_sample_rate": args.vad_sample_rate,
-        "vad_min_speech_sec": args.vad_min_speech_sec,
-        "auto_strategy": args.auto_strategy,
-        "auto_strategy_order": args.auto_strategy_order,
-        "auto_strategy_min_segments": args.auto_strategy_min_segments,
-        "auto_strategy_min_speech_total_sec": args.auto_strategy_min_speech_total_sec,
-        "min_seg_sec": args.min_seg_sec,
-        "max_seg_sec": args.max_seg_sec,
-        "pad_sec": args.pad_sec,
-        "emit_wav": args.emit_wav,
-        "jobs": args.jobs,
-        "overwrite": args.overwrite,
-        "pattern": args.pattern,
-        "out_mode": args.out_mode,
-        "dry_run": args.dry_run,
-        "analyze": args.analyze,
-        "emit_segments": args.emit_segments,
-        "validate_output": getattr(args, "validate_output", False),
-        "export_timeline": getattr(args, "export_timeline", False),
-        "export_csv": getattr(args, "export_csv", False),
-        "export_mask": getattr(args, "export_mask", "none"),
-        "mask_bin_ms": getattr(args, "mask_bin_ms", 50.0),
-        "low_energy_rms_threshold": getattr(args, "low_energy_rms_threshold", 0.01),
-    }
-    
     # 如果使用 energy 策略，忽略 silence 相关参数（但写 warning）
-    if args.strategy == "energy" and args.silence_threshold_db != DEFAULT_SILENCE_THRESHOLD_DB:
+    if final_params["strategy"] == "energy" and final_params.get("silence_threshold_db") != DEFAULT_SILENCE_THRESHOLD_DB:
         print(f"警告: --strategy energy 时忽略 --silence-threshold-db 参数", file=sys.stderr)
     
     try:
         # 解析输入
-        resolver = InputResolver(pattern=args.pattern)
-        jobs = resolver.resolve(input_path, output_dir, args.out_mode)
+        resolver = InputResolver(pattern=final_params["pattern"])
+        jobs = resolver.resolve(input_path, output_dir, final_params["out_mode"])
         
         # 规划并执行（或 dry-run）
         planner = SegmentPlanner(
-            dry_run=args.dry_run,
-            overwrite=args.overwrite,
-            analyze=args.analyze,
-            emit_segments=args.emit_segments,
-            silence_threshold_db=args.silence_threshold_db,
-            validate_output=getattr(args, "validate_output", False),
-            export_timeline=getattr(args, "export_timeline", False),
-            export_csv=getattr(args, "export_csv", False),
-            export_mask=getattr(args, "export_mask", "none"),
-            mask_bin_ms=getattr(args, "mask_bin_ms", 50.0),
+            dry_run=final_params["dry_run"],
+            overwrite=final_params["overwrite"],
+            analyze=final_params["analyze"],
+            emit_segments=final_params["emit_segments"],
+            silence_threshold_db=final_params["silence_threshold_db"],
+            validate_output=final_params.get("validate_output", False),
+            export_timeline=final_params.get("export_timeline", False),
+            export_csv=final_params.get("export_csv", False),
+            export_mask=final_params.get("export_mask", "none"),
+            mask_bin_ms=final_params.get("mask_bin_ms", 50.0),
         )
-        executed_count = planner.plan_and_execute(jobs, params)
+        
+        # R11: 传递 effective_config 和 config_hash 给 planner
+        config_hash = compute_config_hash(effective_config)
+        # 将 config_hash 存储到 planner 实例中，以便在 write_seg_report 中使用
+        planner._current_config_hash = config_hash
+        executed_count = planner.plan_and_execute(
+            jobs,
+            final_params,
+            effective_config=effective_config,
+            config_hash=config_hash,
+        )
         
         return planner.get_exit_code()
     except FileNotFoundError as e:
         print(f"错误: {e}", file=sys.stderr)
-        return 1
+        return 2
+    except (ConfigError, ArgError, DependencyMissingError, InputNotFoundError) as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 2
     except Exception as e:
         print(f"错误: {e}", file=sys.stderr)
         import traceback

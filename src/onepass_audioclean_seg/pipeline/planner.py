@@ -80,17 +80,22 @@ class SegmentPlanner:
         self.job_stats: list[dict[str, Any]] = []  # 记录每个 job 的统计信息
         self.started_at = datetime.now().isoformat()
         self.has_any_error = False  # 记录是否有任何错误
+        self._current_config_hash: Optional[str] = None  # R11: 当前配置哈希
     
     def plan_and_execute(
         self,
         jobs: list[SegJob],
         params: dict[str, Any],
+        effective_config: Optional[dict[str, Any]] = None,
+        config_hash: Optional[str] = None,
     ) -> int:
         """规划并执行（或 dry-run）任务列表
         
         Args:
             jobs: 任务列表
             params: 参数字典（用于写入报告）
+            effective_config: 合并后的最终配置（R11，可选）
+            config_hash: 配置哈希值（R11，可选）
         
         Returns:
             处理的 job 数量
@@ -135,11 +140,14 @@ class SegmentPlanner:
             # 如果不是 dry-run，创建目录并写入最小报告
             if not self.dry_run:
                 try:
+                    # R11: 从 plan_and_execute 的参数中获取 config_hash
+                    config_hash = getattr(self, "_current_config_hash", None)
                     write_seg_report(
                         out_dir=job.out_dir,
                         params=params,
                         audio_path=job.audio_path,
                         meta_path=job.meta_path,
+                        config_hash=config_hash,
                     )
                     executed_count += 1
                     
@@ -199,6 +207,15 @@ class SegmentPlanner:
             jobs_failed=jobs_failed,
             jobs_skipped=jobs_skipped,
         )
+        
+        # R11: 生成 run_manifest.json
+        if not self.dry_run:
+            self._write_run_manifest(
+                jobs=jobs,
+                params=params,
+                effective_config=effective_config,
+                config_hash=config_hash,
+            )
         
         return executed_count
     
@@ -616,7 +633,7 @@ class SegmentPlanner:
                 outputs["exports"] = exports
             segments_report_data["outputs"] = outputs
             
-            update_seg_report_segments(job.out_dir, segments_report_data)
+            update_seg_report_segments(job.out_dir, segments_report_data, audio_path=job.audio_path)
             
             # 11. 打印成功信息
             print(f"EMIT {job.job_id} segments={len(segments_records)} out={job.out_dir}", file=sys.stdout)
@@ -991,7 +1008,7 @@ class SegmentPlanner:
                 outputs["exports"] = exports
             segments_report_data["outputs"] = outputs
             
-            update_seg_report_segments(job.out_dir, segments_report_data)
+            update_seg_report_segments(job.out_dir, segments_report_data, audio_path=job.audio_path)
             
             # 写入 auto-strategy 信息
             auto_strategy_data = {
@@ -1238,4 +1255,179 @@ class SegmentPlanner:
             logger.info(f"写入 run_summary.json: {summary_path}")
         except Exception as e:
             logger.warning(f"写入 run_summary.json 失败: {e}", exc_info=True)
+    
+    def _write_run_manifest(
+        self,
+        jobs: list[SegJob],
+        params: dict[str, Any],
+        effective_config: Optional[dict[str, Any]] = None,
+        config_hash: Optional[str] = None,
+    ) -> None:
+        """写入 run_manifest.json（R11：可复现实验快照）
+        
+        Args:
+            jobs: 任务列表
+            params: 参数字典
+            effective_config: 合并后的最终配置（可选）
+            config_hash: 配置哈希值（可选）
+        """
+        if not jobs:
+            return
+        
+        # 确定输出目录（与 run_summary.json 相同）
+        out_dirs = [job.out_dir for job in jobs]
+        common_parent = out_dirs[0].parent
+        
+        for out_dir in out_dirs[1:]:
+            try:
+                if out_dir.parent != common_parent:
+                    common_parts = []
+                    parts1 = common_parent.parts
+                    parts2 = out_dir.parent.parts
+                    for p1, p2 in zip(parts1, parts2):
+                        if p1 == p2:
+                            common_parts.append(p1)
+                        else:
+                            break
+                    if common_parts:
+                        common_parent = Path(*common_parts)
+                    else:
+                        common_parent = out_dirs[0].parent
+                        break
+            except Exception:
+                common_parent = out_dirs[0].parent
+                break
+        
+        out_mode = params.get("out_mode", "in_place")
+        if out_mode == "out_root" and out_dirs[0].name == "seg":
+            manifest_dir = common_parent.parent if common_parent.name != "seg" else common_parent
+        else:
+            manifest_dir = common_parent
+        
+        # 获取工具版本
+        from onepass_audioclean_seg import __version__
+        
+        # 获取 git commit（可选）
+        git_commit = None
+        import os
+        git_commit_env = os.environ.get("GIT_COMMIT")
+        if git_commit_env:
+            git_commit = git_commit_env
+        else:
+            # 尝试从 .git 读取（简化实现，不依赖 gitpython）
+            try:
+                git_dir = Path.cwd() / ".git"
+                if git_dir.exists():
+                    # 尝试读取 HEAD
+                    head_file = git_dir / "HEAD"
+                    if head_file.exists():
+                        with open(head_file, "r") as f:
+                            head_content = f.read().strip()
+                            if head_content.startswith("ref: "):
+                                ref_path = git_dir / head_content[5:]
+                                if ref_path.exists():
+                                    with open(ref_path, "r") as rf:
+                                        git_commit = rf.read().strip()[:40]  # 取前40字符
+            except Exception:
+                pass  # 忽略错误
+        
+        # 获取环境信息
+        import platform
+        import sys
+        
+        environment = {
+            "python_version": sys.version.split()[0],
+            "platform": platform.platform(),
+            "deps": {},
+        }
+        
+        # 获取依赖版本
+        from onepass_audioclean_seg.audio.ffmpeg import get_ffmpeg_version, get_ffprobe_version, which
+        
+        ffmpeg_path = which("ffmpeg")
+        if ffmpeg_path:
+            ffmpeg_version = get_ffmpeg_version(ffmpeg_path)
+            if ffmpeg_version:
+                environment["deps"]["ffmpeg_version"] = ffmpeg_version
+        
+        ffprobe_path = which("ffprobe")
+        if ffprobe_path:
+            ffprobe_version = get_ffprobe_version(ffprobe_path)
+            if ffprobe_version:
+                environment["deps"]["ffprobe_version"] = ffprobe_version
+        
+        try:
+            import webrtcvad
+            environment["deps"]["webrtcvad_version"] = "available"  # webrtcvad 没有版本 API
+        except ImportError:
+            pass
+        
+        try:
+            import yaml
+            environment["deps"]["pyyaml_version"] = getattr(yaml, "__version__", "unknown")
+        except ImportError:
+            pass
+        
+        # 构建 jobs 列表
+        manifest_jobs = []
+        for job, job_stat in zip(jobs, self.job_stats):
+            job_info = {
+                "job_id": job.job_id,
+                "audio_path": str(job.audio_path.resolve()),
+                "out_dir": str(job.out_dir.resolve()),
+                "status": job_stat["status"],
+            }
+            
+            # 读取 seg_report.json 获取额外信息
+            report_path = job.out_dir / "seg_report.json"
+            if report_path.exists():
+                try:
+                    with open(report_path, "r", encoding="utf-8") as f:
+                        report_data = json.load(f)
+                    
+                    # 获取 chosen_strategy
+                    segments_data = report_data.get("segments", {})
+                    if isinstance(segments_data, dict):
+                        job_info["chosen_strategy"] = segments_data.get("strategy")
+                        job_info["segments_count"] = segments_data.get("count", 0)
+                        job_info["speech_total_sec"] = segments_data.get("speech_total_sec", 0.0)
+                    
+                    # 统计 errors/warnings
+                    errors_count = 0
+                    warnings_count = 0
+                    if "warnings" in segments_data:
+                        warnings_count = len(segments_data["warnings"]) if isinstance(segments_data["warnings"], list) else 0
+                    if job_stat.get("error"):
+                        errors_count = 1
+                    job_info["errors_count"] = errors_count
+                    job_info["warnings_count"] = warnings_count
+                except Exception:
+                    pass
+            
+            manifest_jobs.append(job_info)
+        
+        # 构建 run_manifest
+        finished_at = datetime.now().isoformat()
+        
+        manifest = {
+            "tool": "onepass-audioclean-seg",
+            "version": __version__,
+            "git": git_commit,
+            "started_at": self.started_at,
+            "finished_at": finished_at,
+            "command": sys.argv,
+            "effective_config": effective_config or {},
+            "environment": environment,
+            "jobs": manifest_jobs,
+        }
+        
+        # 写入文件
+        manifest_path = manifest_dir / "run_manifest.json"
+        try:
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+            logger.info(f"写入 run_manifest.json: {manifest_path}")
+        except Exception as e:
+            logger.warning(f"写入 run_manifest.json 失败: {e}", exc_info=True)
 

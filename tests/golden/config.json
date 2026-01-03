@@ -1,0 +1,23 @@
+{
+  "strategy": {
+    "name": "energy"
+  },
+  "energy": {
+    "threshold_rms": 0.02,
+    "frame_ms": 30.0,
+    "hop_ms": 10.0,
+    "smooth_ms": 100.0,
+    "min_speech_sec": 0.20
+  },
+  "postprocess": {
+    "min_seg_sec": 1.0,
+    "max_seg_sec": 25.0,
+    "pad_sec": 0.1
+  },
+  "runtime": {
+    "jobs": 1,
+    "overwrite": true,
+    "out_mode": "out_root"
+  }
+}
+

@@ -32,6 +32,7 @@ def write_seg_report(
     params: dict[str, Any],
     audio_path: Path,
     meta_path: Optional[Path] = None,
+    config_hash: Optional[str] = None,
 ) -> Path:
     """写入最小 seg_report.json 文件
     
@@ -40,17 +41,27 @@ def write_seg_report(
         params: 参数字典（包含 strategy、min_seg_sec 等）
         audio_path: 音频文件路径
         meta_path: meta.json 路径（可选）
+        config_hash: 配置哈希值（R11，可选）
     
     Returns:
         seg_report.json 的路径
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     
+    # R11: 计算音频指纹
+    audio_fingerprint = None
+    try:
+        from onepass_audioclean_seg.audio.fingerprint import fingerprint_audio_wav
+        audio_fingerprint = fingerprint_audio_wav(audio_path)
+    except Exception:
+        pass  # 忽略错误
+    
     report = {
-        "version": "R3",
+        "version": "R11",
         "created_at": datetime.now().isoformat(),
-        "versions": {
-            "onepass_audioclean_seg": __version__,
+        "tool": {
+            "name": "onepass-audioclean-seg",
+            "version": __version__,
         },
         "planned": True,  # R3 阶段只做计划
         "params": params,
@@ -58,6 +69,12 @@ def write_seg_report(
         "meta_path": str(meta_path.resolve()) if meta_path else None,
         "segments": [],  # R3 阶段为空列表
     }
+    
+    # R11: 添加 config_hash 和 audio_fingerprint
+    if config_hash:
+        report["config_hash"] = config_hash
+    if audio_fingerprint:
+        report["audio_fingerprint"] = audio_fingerprint
     
     report_path = out_dir / "seg_report.json"
     with open(report_path, "w", encoding="utf-8") as f:
@@ -88,11 +105,19 @@ def update_seg_report_analysis(
     if existing_report is None:
         # 如果报告不存在，创建一个最小报告
         existing_report = {
-            "version": "R4",
+            "version": "R11",
             "created_at": datetime.now().isoformat(),
-            "versions": {
-                "onepass_audioclean_seg": __version__,
+            "tool": {
+                "name": "onepass-audioclean-seg",
+                "version": __version__,
             },
+        }
+    
+    # R11: 确保 tool 字段存在
+    if "tool" not in existing_report:
+        existing_report["tool"] = {
+            "name": "onepass-audioclean-seg",
+            "version": __version__,
         }
     
     # 合并 analysis 字段
@@ -112,12 +137,14 @@ def update_seg_report_analysis(
 def update_seg_report_segments(
     out_dir: Path,
     segments_data: dict[str, Any],
+    audio_path: Optional[Path] = None,
 ) -> Path:
     """更新 seg_report.json 的 segments 字段（读旧 -> 合并 -> 写新）
     
     Args:
         out_dir: 输出目录
         segments_data: 要添加的 segments 数据（例如 {"count": N, "speech_total_sec": ...}）
+        audio_path: 音频文件路径（R11，用于计算指纹，可选）
     
     Returns:
         seg_report.json 的路径
@@ -131,12 +158,30 @@ def update_seg_report_segments(
     if existing_report is None:
         # 如果报告不存在，创建一个最小报告
         existing_report = {
-            "version": "R5",
+            "version": "R11",
             "created_at": datetime.now().isoformat(),
-            "versions": {
-                "onepass_audioclean_seg": __version__,
+            "tool": {
+                "name": "onepass-audioclean-seg",
+                "version": __version__,
             },
         }
+    
+    # R11: 确保 tool 字段存在
+    if "tool" not in existing_report:
+        existing_report["tool"] = {
+            "name": "onepass-audioclean-seg",
+            "version": __version__,
+        }
+    
+    # R11: 如果 audio_path 提供且 audio_fingerprint 不存在，计算指纹
+    if audio_path and "audio_fingerprint" not in existing_report:
+        try:
+            from onepass_audioclean_seg.audio.fingerprint import fingerprint_audio_wav
+            audio_fingerprint = fingerprint_audio_wav(audio_path)
+            if audio_fingerprint:
+                existing_report["audio_fingerprint"] = audio_fingerprint
+        except Exception:
+            pass  # 忽略错误
     
     # 合并 segments 字段（覆盖）
     existing_report["segments"] = segments_data

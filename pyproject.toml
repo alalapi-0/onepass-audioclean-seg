@@ -32,6 +32,9 @@ dev = [
 vad = [
     "webrtcvad>=2.0.10",
 ]
+yaml = [
+    "pyyaml>=6.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
