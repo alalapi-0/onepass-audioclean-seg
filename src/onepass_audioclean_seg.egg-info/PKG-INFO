@@ -1,3 +1,23 @@
+Metadata-Version: 2.4
+Name: onepass-audioclean-seg
+Version: 0.1.0
+Summary: Repo2 分段模块：将长音频切成候选片段（segments）
+Author: onepass
+License: MIT
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Dynamic: license-file
+
 # onepass-audioclean-seg
 
 Repo2 分段模块：将长音频切成候选片段（segments）
@@ -28,8 +48,6 @@ pip install -e ".[dev]"
 
 ### 检查依赖
 
-Repo2 默认分段策略依赖 ffmpeg 的 `silencedetect` 滤镜，因此需要系统安装 ffmpeg 和 ffprobe。
-
 ```bash
 # 基本用法
 audioclean-seg check-deps
@@ -41,20 +59,7 @@ audioclean-seg check-deps --json
 audioclean-seg check-deps --verbose
 ```
 
-`check-deps` 会检查以下内容：
-- `ffmpeg` 是否存在（PATH 可找到）且可执行
-- `ffprobe` 是否存在（PATH 可找到）且可执行
-- `ffmpeg` 是否支持 `silencedetect` 滤镜
-- 输出版本信息
-
-#### 安装 ffmpeg
-
-如果依赖检查失败，请根据操作系统安装 ffmpeg：
-
-- **macOS**: `brew install ffmpeg`
-- **Ubuntu/Debian**: `sudo apt-get install ffmpeg`
-- **CentOS/RHEL**: `sudo yum install ffmpeg`
-- **Windows**: 从 [ffmpeg.org](https://ffmpeg.org) 下载并加入 PATH
+**注意**: R1 版本仅提供占位实现，不会真正检查依赖。
 
 ### 音频分段
 
@@ -103,5 +108,4 @@ pytest tests/test_cli_help.py -v
 ## 版本说明
 
 - **R1**: 项目骨架完成，CLI 可运行，占位实现
-- **R2**: 实现真实的依赖检查（ffmpeg/ffprobe/silencedetect）
 - 后续版本将实现真实的分段算法

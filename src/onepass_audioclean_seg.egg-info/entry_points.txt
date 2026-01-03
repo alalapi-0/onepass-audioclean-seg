@@ -1,0 +1,2 @@
+[console_scripts]
+audioclean-seg = onepass_audioclean_seg.cli:main

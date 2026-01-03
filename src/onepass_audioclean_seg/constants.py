@@ -1,0 +1,14 @@
+"""常量定义：版本、默认值、枚举字符串等"""
+
+# 默认值
+DEFAULT_STRATEGY = "silence"
+DEFAULT_MIN_SILENCE_SEC = 0.5
+DEFAULT_MIN_SEG_SEC = 1.0
+DEFAULT_MAX_SEG_SEC = 30.0
+DEFAULT_PAD_SEC = 0.1
+DEFAULT_JOBS = 1
+DEFAULT_LOG_LEVEL = "INFO"
+
+# 策略枚举
+STRATEGY_CHOICES = ["silence", "energy", "vad"]
+
