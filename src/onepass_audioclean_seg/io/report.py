@@ -108,3 +108,43 @@ def update_seg_report_analysis(
     
     return report_path
 
+
+def update_seg_report_segments(
+    out_dir: Path,
+    segments_data: dict[str, Any],
+) -> Path:
+    """更新 seg_report.json 的 segments 字段（读旧 -> 合并 -> 写新）
+    
+    Args:
+        out_dir: 输出目录
+        segments_data: 要添加的 segments 数据（例如 {"count": N, "speech_total_sec": ...}）
+    
+    Returns:
+        seg_report.json 的路径
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "seg_report.json"
+    
+    # 读取现有报告（如果存在）
+    existing_report = read_seg_report(report_path)
+    
+    if existing_report is None:
+        # 如果报告不存在，创建一个最小报告
+        existing_report = {
+            "version": "R5",
+            "created_at": datetime.now().isoformat(),
+            "versions": {
+                "onepass_audioclean_seg": __version__,
+            },
+        }
+    
+    # 合并 segments 字段（覆盖）
+    existing_report["segments"] = segments_data
+    existing_report["updated_at"] = datetime.now().isoformat()
+    
+    # 写回
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(existing_report, f, ensure_ascii=False, indent=2)
+    
+    return report_path
+

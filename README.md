@@ -144,7 +144,59 @@ audioclean-seg segment \
 - 目前仅支持 `silence` 策略（其他策略会跳过分析）
 - 需要系统安装 `ffmpeg` 和 `ffprobe`
 
-**注意**: R3 版本实现输入解析与计划输出，会生成 `seg_report.json` 但不会实际分段。R4 版本实现了 `silencedetect` 静音分析功能，可以输出静音区间中间文件。后续版本将实现完整的 `silence`、`energy`、`vad` 分段功能。
+#### R5 新功能：生成语音片段
+
+R5 版本引入 `--emit-segments` 参数，可以从静音区间生成语音片段并输出 `segments.jsonl`。
+
+**基本用法**:
+
+```bash
+# 从已有的 silences.json 生成 segments.jsonl（需要先运行 --analyze 或自动触发分析）
+audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --emit-segments
+
+# 一次性运行分析并生成片段（推荐）
+audioclean-seg segment \
+    --in audio.wav \
+    --out output_dir \
+    --emit-segments \
+    --strategy silence \
+    --min-seg-sec 1.0 \
+    --pad-sec 0.1
+
+# 分步运行（先分析，再生成片段）
+audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --analyze
+audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --emit-segments --min-seg-sec 1.0 --pad-sec 0.1
+```
+
+**输出文件**:
+
+- `<out_dir>/segments.jsonl`: 语音片段列表（JSONL 格式，一行一个片段）
+- `<out_dir>/seg_report.json`: 更新 `segments` 字段，包含片段统计信息
+
+**segments.jsonl 格式**:
+
+每行是一个 JSON 对象，包含以下字段：
+
+- `id`: 片段 ID（如 `"seg_000001"`，按 start 升序编号）
+- `start_sec`: 片段开始时间（秒）
+- `end_sec`: 片段结束时间（秒）
+- `duration_sec`: 片段时长（秒）
+- `source_audio`: 源音频文件路径（绝对路径）
+- `pre_silence_sec`: 该片段前一个静音区间的时长（秒，若没有则为 0）
+- `post_silence_sec`: 该片段后一个静音区间的时长（秒，若没有则为 0）
+- `is_speech`: 是否为语音片段（`true`）
+- `strategy`: 分段策略（`"silence"`）
+
+所有时间字段统一保留 3 位小数。
+
+**注意**:
+
+- `--emit-segments` 需要关闭 `--dry-run`（两者不能同时使用）
+- 如果 `silences.json` 不存在，`--emit-segments` 会自动触发分析（方案1，推荐）
+- 目前仅支持 `silence` 策略（其他策略会跳过并打印 SKIP-EMIT）
+- 如果 `segments.jsonl` 已存在且 `--overwrite=false`，会跳过该 job
+
+**注意**: R3 版本实现输入解析与计划输出，会生成 `seg_report.json` 但不会实际分段。R4 版本实现了 `silencedetect` 静音分析功能，可以输出静音区间中间文件。R5 版本实现了从静音区间生成语音片段的功能，可以输出 `segments.jsonl`。后续版本将实现更复杂的分段策略（`energy`、`vad`）和片段合并功能。
 
 ### 全局选项
 

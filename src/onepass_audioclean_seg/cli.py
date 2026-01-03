@@ -128,6 +128,12 @@ def create_parser() -> argparse.ArgumentParser:
         help="运行静音分析并输出 silences.json（默认: False）",
     )
     segment_parser.add_argument(
+        "--emit-segments",
+        action="store_true",
+        default=False,
+        help="生成语音片段并输出 segments.jsonl（默认: False）",
+    )
+    segment_parser.add_argument(
         "--min-seg-sec",
         type=float,
         default=DEFAULT_MIN_SEG_SEC,
@@ -215,7 +221,7 @@ def cmd_check_deps(args: argparse.Namespace) -> int:
 
 
 def cmd_segment(args: argparse.Namespace) -> int:
-    """执行 segment 子命令（R3：输入解析与计划；R4：静音分析）"""
+    """执行 segment 子命令（R3：输入解析与计划；R4：静音分析；R5：生成片段）"""
     from onepass_audioclean_seg.pipeline.resolver import InputResolver
     from onepass_audioclean_seg.pipeline.planner import SegmentPlanner
     
@@ -225,6 +231,28 @@ def cmd_segment(args: argparse.Namespace) -> int:
     # 检查 --analyze 和 --dry-run 的冲突
     if args.analyze and args.dry_run:
         print("错误: --analyze 需要关闭 --dry-run", file=sys.stderr)
+        return 2
+    
+    # 检查 --emit-segments 和 --dry-run 的冲突
+    if args.emit_segments and args.dry_run:
+        print("错误: --emit-segments 需要关闭 --dry-run", file=sys.stderr)
+        return 2
+    
+    # 参数校验
+    if args.pad_sec < 0:
+        print(f"错误: --pad-sec 必须 >= 0，当前值: {args.pad_sec}", file=sys.stderr)
+        return 2
+    
+    if args.min_seg_sec <= 0:
+        print(f"错误: --min-seg-sec 必须 > 0，当前值: {args.min_seg_sec}", file=sys.stderr)
+        return 2
+    
+    if args.min_silence_sec <= 0:
+        print(f"错误: --min-silence-sec 必须 > 0，当前值: {args.min_silence_sec}", file=sys.stderr)
+        return 2
+    
+    if args.max_seg_sec < args.min_seg_sec:
+        print(f"错误: --max-seg-sec ({args.max_seg_sec}) 必须 >= --min-seg-sec ({args.min_seg_sec})", file=sys.stderr)
         return 2
     
     # 检查 ffmpeg 是否存在（如果使用 analyze）
@@ -250,6 +278,7 @@ def cmd_segment(args: argparse.Namespace) -> int:
         "out_mode": args.out_mode,
         "dry_run": args.dry_run,
         "analyze": args.analyze,
+        "emit_segments": args.emit_segments,
     }
     
     try:
@@ -262,6 +291,7 @@ def cmd_segment(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             overwrite=args.overwrite,
             analyze=args.analyze,
+            emit_segments=args.emit_segments,
             silence_threshold_db=args.silence_threshold_db,
         )
         executed_count = planner.plan_and_execute(jobs, params)

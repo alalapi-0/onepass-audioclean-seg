@@ -8,9 +8,21 @@ from typing import Any
 
 from onepass_audioclean_seg.audio.ffmpeg import which
 from onepass_audioclean_seg.audio.probe import get_audio_duration_sec
-from onepass_audioclean_seg.io.report import update_seg_report_analysis, write_seg_report
+from onepass_audioclean_seg.io.report import (
+    update_seg_report_analysis,
+    update_seg_report_segments,
+    write_seg_report,
+)
+from onepass_audioclean_seg.io.segments import SegmentRecord, write_segments_jsonl
 from onepass_audioclean_seg.pipeline.jobs import SegJob
+from onepass_audioclean_seg.pipeline.segments_from_silence import (
+    apply_padding_and_clip,
+    complement_to_speech_segments,
+    filter_min_duration,
+    normalize_intervals,
+)
 from onepass_audioclean_seg.strategies.silence_ffmpeg import (
+    SilenceInterval,
     parse_silencedetect_output,
     run_silencedetect,
 )
@@ -26,6 +38,7 @@ class SegmentPlanner:
         dry_run: bool = False,
         overwrite: bool = False,
         analyze: bool = False,
+        emit_segments: bool = False,
         silence_threshold_db: float = -35.0,
     ):
         """
@@ -33,13 +46,16 @@ class SegmentPlanner:
             dry_run: 是否为 dry-run 模式（只打印计划，不写入文件）
             overwrite: 是否覆盖已存在的文件
             analyze: 是否运行静音分析
+            emit_segments: 是否生成语音片段
             silence_threshold_db: 静音检测阈值（dB）
         """
         self.dry_run = dry_run
         self.overwrite = overwrite
         self.analyze = analyze
+        self.emit_segments = emit_segments
         self.silence_threshold_db = silence_threshold_db
         self.has_analyze_error = False  # 记录是否有 analyze 错误
+        self.has_emit_error = False  # 记录是否有 emit segments 错误
     
     def plan_and_execute(
         self,
@@ -63,8 +79,14 @@ class SegmentPlanner:
         
         for job in jobs:
             # 检查是否跳过（如果 overwrite=False 且输出已存在）
-            segments_file = job.out_dir / "segments.jsonl"
-            if not self.overwrite and segments_file.exists():
+            # 对于 emit_segments，检查 segments.jsonl；对于 analyze，检查 silences.json
+            skip_file = None
+            if self.emit_segments:
+                skip_file = job.out_dir / "segments.jsonl"
+            elif self.analyze:
+                skip_file = job.out_dir / "silences.json"
+            
+            if skip_file and not self.overwrite and skip_file.exists():
                 warnings_str = f" warnings={len(job.warnings)}" if job.warnings else ""
                 print(f"SKIP {job.job_id} audio={job.audio_path} out={job.out_dir}{warnings_str}", file=sys.stdout)
                 continue
@@ -86,6 +108,10 @@ class SegmentPlanner:
                     # 如果启用 analyze，运行静音分析
                     if self.analyze:
                         self._run_analyze(job, params)
+                    
+                    # 如果启用 emit_segments，生成语音片段
+                    if self.emit_segments:
+                        self._run_emit_segments(job, params)
                 except Exception as e:
                     logger.error(f"写入报告失败 {job.job_id}: {e}", exc_info=True)
                     print(f"ERROR {job.job_id} failed to write report: {e}", file=sys.stderr)
@@ -98,9 +124,9 @@ class SegmentPlanner:
         """获取退出码
         
         Returns:
-            0 表示成功，1 表示有 analyze 错误
+            0 表示成功，1 表示有错误（analyze 或 emit_segments）
         """
-        return 1 if self.has_analyze_error else 0
+        return 1 if (self.has_analyze_error or self.has_emit_error) else 0
     
     def _run_analyze(self, job: SegJob, params: dict[str, Any]) -> None:
         """运行静音分析
@@ -188,6 +214,152 @@ class SegmentPlanner:
             error_msg = str(e)[:100]  # 限制长度
             print(f"FAIL {job.job_id} error={error_msg}", file=sys.stdout)
             logger.error(f"分析失败 {job.job_id}: {e}", exc_info=True)
+    
+    def _run_emit_segments(self, job: SegJob, params: dict[str, Any]) -> None:
+        """生成语音片段并写入 segments.jsonl
+        
+        Args:
+            job: 任务对象
+            params: 参数字典
+        """
+        strategy = params.get("strategy", "silence")
+        
+        # 只支持 silence 策略
+        if strategy != "silence":
+            print(f"SKIP-EMIT {job.job_id} reason=strategy_not_supported", file=sys.stdout)
+            return
+        
+        try:
+            # 确保 out_dir 存在
+            job.out_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 1. 读取或生成 silences.json
+            silences_path = job.out_dir / "silences.json"
+            silences_data = None
+            
+            if silences_path.exists():
+                # 读取现有的 silences.json
+                with open(silences_path, "r", encoding="utf-8") as f:
+                    silences_data = json.load(f)
+                logger.info(f"使用现有的 silences.json: {silences_path}")
+            else:
+                # 方案1（推荐）：自动触发分析
+                # 如果 analyze=True，_run_analyze 应该在 _run_emit_segments 之前执行
+                # 但如果 silences.json 仍不存在，说明 analyze 失败或未执行，我们尝试再次运行
+                logger.info(f"silences.json 不存在，自动触发分析")
+                self._run_analyze(job, params)
+                
+                # 重新读取 silences.json
+                if silences_path.exists():
+                    with open(silences_path, "r", encoding="utf-8") as f:
+                        silences_data = json.load(f)
+                else:
+                    raise RuntimeError("自动分析后 silences.json 仍不存在（分析可能失败）")
+            
+            # 2. 获取 duration_sec（从 silences_data 或 meta.json 或 ffprobe）
+            duration_sec = None
+            if silences_data and "duration_sec" in silences_data:
+                duration_sec = silences_data.get("duration_sec")
+            
+            if duration_sec is None:
+                duration_sec = get_audio_duration_sec(
+                    audio_path=job.audio_path,
+                    meta_path=job.meta_path,
+                )
+            
+            if duration_sec is None:
+                raise RuntimeError("无法获取音频时长（需要 meta.json 或 ffprobe）")
+            
+            # 3. 解析静音区间
+            silence_intervals = [
+                SilenceInterval(
+                    start_sec=item["start_sec"],
+                    end_sec=item["end_sec"],
+                    duration_sec=item["duration_sec"],
+                )
+                for item in silences_data.get("silences", [])
+            ]
+            
+            # 4. 规范化静音区间
+            normalized_silences = normalize_intervals(silence_intervals, duration_sec)
+            
+            # 5. 生成语音段（补集）
+            speech_segments = complement_to_speech_segments(normalized_silences, duration_sec)
+            
+            # 6. 应用填充和裁剪
+            pad_sec = params.get("pad_sec", 0.1)
+            padded_segments = apply_padding_and_clip(speech_segments, pad_sec, duration_sec)
+            
+            # 7. 过滤最小时长
+            min_seg_sec = params.get("min_seg_sec", 1.0)
+            filtered_segments = filter_min_duration(padded_segments, min_seg_sec)
+            
+            if not filtered_segments:
+                logger.warning(f"过滤后没有剩余片段")
+                # 仍然写入空的 segments.jsonl 和更新报告
+                segments_records = []
+            else:
+                # 8. 构建 SegmentRecord 列表（计算 pre_silence_sec 和 post_silence_sec）
+                segments_records = []
+                audio_path_abs = str(job.audio_path.resolve())
+                
+                for idx, (start, end) in enumerate(filtered_segments, start=1):
+                    seg_id = f"seg_{idx:06d}"
+                    duration = end - start
+                    
+                    # 计算 pre_silence_sec 和 post_silence_sec
+                    pre_silence_sec = 0.0
+                    post_silence_sec = 0.0
+                    
+                    # 查找前一个静音区间（end == start，考虑容差 1e-3）
+                    for silence in normalized_silences:
+                        if abs(silence.end_sec - start) <= 0.001:
+                            pre_silence_sec = silence.duration_sec
+                            break
+                    
+                    # 查找后一个静音区间（start == end，考虑容差 1e-3）
+                    for silence in normalized_silences:
+                        if abs(silence.start_sec - end) <= 0.001:
+                            post_silence_sec = silence.duration_sec
+                            break
+                    
+                    record = SegmentRecord(
+                        id=seg_id,
+                        start_sec=round(start, 3),
+                        end_sec=round(end, 3),
+                        duration_sec=round(duration, 3),
+                        source_audio=audio_path_abs,
+                        pre_silence_sec=round(pre_silence_sec, 3),
+                        post_silence_sec=round(post_silence_sec, 3),
+                        is_speech=True,
+                        strategy="silence",
+                    )
+                    segments_records.append(record)
+            
+            # 9. 写入 segments.jsonl
+            segments_path = job.out_dir / "segments.jsonl"
+            write_segments_jsonl(segments_path, segments_records)
+            
+            # 10. 更新 seg_report.json
+            speech_total_sec = sum(record.duration_sec for record in segments_records)
+            segments_report_data = {
+                "count": len(segments_records),
+                "speech_total_sec": round(speech_total_sec, 3),
+                "min_seg_sec": min_seg_sec,
+                "pad_sec": pad_sec,
+                "strategy": "silence",
+            }
+            update_seg_report_segments(job.out_dir, segments_report_data)
+            
+            # 11. 打印成功信息
+            print(f"EMIT {job.job_id} segments={len(segments_records)} out={job.out_dir}", file=sys.stdout)
+            
+        except Exception as e:
+            # 记录错误
+            self.has_emit_error = True
+            error_msg = str(e)[:100]  # 限制长度
+            print(f"FAIL {job.job_id} error={error_msg}", file=sys.stdout)
+            logger.error(f"生成片段失败 {job.job_id}: {e}", exc_info=True)
     
     def _print_plan(self, job: SegJob) -> None:
         """打印单个 job 的计划行"""
