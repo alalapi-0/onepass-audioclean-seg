@@ -279,6 +279,61 @@ def create_parser() -> argparse.ArgumentParser:
         default=False,
         help="生成 segments.jsonl 后立即验证输出（默认: False）",
     )
+    # R10: 导出可视化友好文件
+    segment_parser.add_argument(
+        "--export-timeline",
+        action="store_true",
+        default=False,
+        help="导出 timeline.json（单文件，供前端直接加载，默认: False）",
+    )
+    segment_parser.add_argument(
+        "--export-csv",
+        action="store_true",
+        default=False,
+        help="导出 segments.csv（表格友好，默认: False）",
+    )
+    segment_parser.add_argument(
+        "--export-mask",
+        choices=["none", "energy", "vad", "auto"],
+        default="none",
+        help="导出 mask.json（降采样帧级信息，默认: none）",
+    )
+    segment_parser.add_argument(
+        "--mask-bin-ms",
+        type=float,
+        default=50.0,
+        help="mask 降采样 bin 大小（毫秒，默认: 50）",
+    )
+    segment_parser.add_argument(
+        "--low-energy-rms-threshold",
+        type=float,
+        default=0.01,
+        help="低能量 RMS 阈值（归一化到 [0, 1]，默认: 0.01）",
+    )
+    
+    # summarize 子命令（R10）
+    summarize_parser = subparsers.add_parser(
+        "summarize",
+        help="快速浏览 segments.jsonl 摘要（R10）",
+    )
+    summarize_parser.add_argument(
+        "--in",
+        dest="input_path",
+        required=True,
+        help="输入路径：segments.jsonl 文件、目录或 out_root（必填）",
+    )
+    summarize_parser.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        help="显示 flags 计数 Top N（默认: 5）",
+    )
+    summarize_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="以 JSON 格式输出汇总（默认: False）",
+    )
     
     # validate 子命令
     validate_parser = subparsers.add_parser(
@@ -360,6 +415,68 @@ def cmd_check_deps(args: argparse.Namespace) -> int:
                 "error": str(e),
             }
             print(json.dumps(error_report, ensure_ascii=False))
+        else:
+            print(f"错误: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_summarize(args: argparse.Namespace) -> int:
+    """执行 summarize 子命令（R10）"""
+    from onepass_audioclean_seg.io.summarize import summarize_segments
+    
+    input_path = Path(args.input_path)
+    
+    try:
+        result = summarize_segments(
+            input_path=input_path,
+            top_n=args.top,
+            json_output=args.json,
+        )
+        
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            # 文本模式输出
+            for item in result.get("items", []):
+                path = item.get("path", "")
+                stats = item.get("stats", {})
+                print(f"\n{path}")
+                print(f"  segments={stats.get('count', 0)}")
+                print(f"  speech_total_sec={stats.get('speech_total_sec', 0.0):.3f}")
+                print(f"  avg_duration={stats.get('avg_duration', 0.0):.3f}")
+                print(f"  median_duration={stats.get('median_duration', 0.0):.3f}")
+                print(f"  min_duration={stats.get('min_duration', 0.0):.3f}")
+                print(f"  max_duration={stats.get('max_duration', 0.0):.3f}")
+                flags_count = stats.get("flags_count", {})
+                if flags_count:
+                    print(f"  flags_top_{args.top}:")
+                    for flag, count in list(flags_count.items())[:args.top]:
+                        print(f"    {flag}={count}")
+                strategy_info = stats.get("strategy_info", {})
+                if strategy_info:
+                    print(f"  strategy={strategy_info.get('strategy', 'unknown')}")
+                    if strategy_info.get("auto_chosen"):
+                        print(f"  auto_strategy={strategy_info.get('auto_strategy', {})}")
+            
+            print(f"\n汇总: checked={result.get('checked_files', 0)}")
+        
+        # 根据结果返回退出码
+        if result.get("ok", False):
+            return 0
+        elif result.get("error_code") == "no_files":
+            return 2
+        else:
+            return 1
+    except Exception as e:
+        if args.json:
+            error_report = {
+                "ok": False,
+                "error_code": "unexpected_error",
+                "checked_files": 0,
+                "error": str(e),
+                "items": [],
+            }
+            print(json.dumps(error_report, ensure_ascii=False, indent=2))
         else:
             print(f"错误: {e}", file=sys.stderr)
         return 1
@@ -534,6 +651,11 @@ def cmd_segment(args: argparse.Namespace) -> int:
         "analyze": args.analyze,
         "emit_segments": args.emit_segments,
         "validate_output": getattr(args, "validate_output", False),
+        "export_timeline": getattr(args, "export_timeline", False),
+        "export_csv": getattr(args, "export_csv", False),
+        "export_mask": getattr(args, "export_mask", "none"),
+        "mask_bin_ms": getattr(args, "mask_bin_ms", 50.0),
+        "low_energy_rms_threshold": getattr(args, "low_energy_rms_threshold", 0.01),
     }
     
     # 如果使用 energy 策略，忽略 silence 相关参数（但写 warning）
@@ -553,6 +675,10 @@ def cmd_segment(args: argparse.Namespace) -> int:
             emit_segments=args.emit_segments,
             silence_threshold_db=args.silence_threshold_db,
             validate_output=getattr(args, "validate_output", False),
+            export_timeline=getattr(args, "export_timeline", False),
+            export_csv=getattr(args, "export_csv", False),
+            export_mask=getattr(args, "export_mask", "none"),
+            mask_bin_ms=getattr(args, "mask_bin_ms", 50.0),
         )
         executed_count = planner.plan_and_execute(jobs, params)
         
@@ -591,6 +717,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_segment(args)
         elif args.command == "validate":
             return cmd_validate(args)
+        elif args.command == "summarize":
+            return cmd_summarize(args)
         else:
             parser.print_help()
             return 2

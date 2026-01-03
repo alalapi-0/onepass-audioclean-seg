@@ -2,16 +2,24 @@
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# R10: flags 排序优先级（固定顺序，避免 diff 噪声）
+FLAGS_ORDER = [
+    "split_from_long",
+    "merged_short",
+    "edge_clipped",
+    "low_energy",
+]
+
 
 @dataclass
 class SegmentRecord:
-    """片段记录数据类"""
+    """片段记录数据类（R10：扩充 flags/source/quality）"""
     
     id: str
     start_sec: float
@@ -25,11 +33,16 @@ class SegmentRecord:
     rms: Optional[float] = None  # RMS 值（归一化到 [0, 1]）
     energy_db: Optional[float] = None  # 能量 dB 值
     notes: Optional[dict] = None  # 额外信息（如 split_reason, merged_from 等）
+    # R10 新增字段
+    flags: list[str] = field(default_factory=list)  # 标志列表，如 ["split_from_long", "low_energy"]
+    source: Optional[dict] = None  # 来源信息：{"strategy": "...", "auto_chosen": bool, "raw_index": int, "derived_from": [...]}
+    quality: Optional[dict] = None  # 质量信息：{"rms": float, "energy_db": float, "confidence_hint": float}
     
     def to_dict(self) -> dict:
         """转换为字典（用于 JSON 序列化）
         
         注意：时间字段已 round(3)，rms 保留更高精度（round(6)），energy_db round(2)
+        R10: flags 按固定顺序排序
         """
         data = asdict(self)
         # 确保时间字段都是 round(3)
@@ -46,6 +59,16 @@ class SegmentRecord:
         # energy_db 保留 2 位小数
         if data.get("energy_db") is not None:
             data["energy_db"] = round(data["energy_db"], 2)
+        
+        # R10: flags 按固定顺序排序（确定性输出）
+        if "flags" in data and isinstance(data["flags"], list):
+            flags = data["flags"]
+            # 按 FLAGS_ORDER 排序，未在列表中的排在最后
+            sorted_flags = sorted(
+                flags,
+                key=lambda f: (FLAGS_ORDER.index(f) if f in FLAGS_ORDER else len(FLAGS_ORDER), f)
+            )
+            data["flags"] = sorted_flags
         
         # 移除 None 值（可选，但为了 JSON 简洁性）
         # 这里保留 None 值，让调用方决定是否过滤

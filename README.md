@@ -302,6 +302,58 @@ audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --emi
 - `<out_dir>/segments/seg_*.wav`: 每个片段的 WAV 文件（如果启用 `--emit-wav`）
 - `<out_dir>/seg_report.json`: 更新 `segments` 字段，包含片段统计信息
 
+#### R10 新功能：可视化/调参友好输出
+
+R10 版本新增了可视化友好的导出功能和片段元数据扩充：
+
+1. **片段 flags/source/quality 字段**（R10 新增）：
+   - `flags`: 标志列表，如 `["split_from_long", "merged_short", "edge_clipped", "low_energy"]`
+   - `source`: 来源信息（策略、是否 auto-chosen、原始索引等）
+   - `quality`: 质量信息（rms、energy_db、confidence_hint 占位）
+
+2. **可视化友好导出**：
+   - `--export-timeline`: 导出 `timeline.json`（单文件，供前端直接加载）
+   - `--export-csv`: 导出 `segments.csv`（表格友好）
+   - `--export-mask`: 导出 `mask.json`（降采样帧级信息，支持 `none|energy|vad|auto`）
+   - `--mask-bin-ms`: mask 降采样 bin 大小（默认 50 毫秒）
+   - `--low-energy-rms-threshold`: 低能量 RMS 阈值（默认 0.01）
+
+3. **summarize 命令**：
+   - 快速浏览 segments.jsonl 摘要
+   - 支持文件、目录或 out_root 输入
+   - 支持 `--json` 格式输出
+
+**基本用法**:
+
+```bash
+# 生成片段并导出可视化文件
+audioclean-seg segment \
+    --in audio.wav \
+    --out output_dir \
+    --emit-segments \
+    --export-timeline \
+    --export-csv \
+    --export-mask auto \
+    --mask-bin-ms 50 \
+    --low-energy-rms-threshold 0.01
+
+# 快速浏览摘要
+audioclean-seg summarize --in output_dir
+
+# JSON 格式输出
+audioclean-seg summarize --in output_dir --json --top 10
+```
+
+**输出文件**:
+
+- `<out_dir>/timeline.json`: 时间轴数据（供前端渲染）
+- `<out_dir>/segments.csv`: 表格格式的片段列表
+- `<out_dir>/mask.json`: 降采样帧级信息（用于绘制语音概率/能量条）
+
+**Repo6 集成说明**：
+
+Repo6 可以直接加载 `timeline.json` + `mask.json` 做三轨道渲染的 Track2（Auto）基础。`timeline.json` 包含前端渲染需要的子集字段，`mask.json` 提供降采样后的帧级信息用于绘制可视化图表。
+
 **segments.jsonl 格式（R6 增强）**:
 
 每行是一个 JSON 对象，包含以下字段：
@@ -318,6 +370,9 @@ audioclean-seg segment --in <workdir> --out <out_root> --out-mode out_root --emi
 - `rms`: RMS 值（归一化到 [0, 1]，round(6)，R6 新增）
 - `energy_db`: 能量 dB 值（round(2)，R6 新增，可选）
 - `notes`: 额外信息（如 `{"split_reason":"max_len"}` 或 `{"merged_from":2}`，R6 新增，可选）
+- `flags`: 标志列表（R10 新增），如 `["split_from_long", "merged_short", "edge_clipped", "low_energy"]`
+- `source`: 来源信息（R10 新增），包含策略、是否 auto-chosen、原始索引等
+- `quality`: 质量信息（R10 新增），包含 rms、energy_db、confidence_hint 等
 
 所有时间字段统一保留 3 位小数，RMS 保留 6 位小数，energy_db 保留 2 位小数。
 
@@ -446,4 +501,10 @@ pytest tests/test_cli_help.py -v
   - `segment` 命令新增 `--validate-output` 选项
   - 自动生成 `run_summary.json` 批处理汇总报告
   - 新增 `schemas/` 目录，包含协议文档（JSON Schema）
-- 后续版本将实现更复杂的分段策略（`energy`、`vad`）和低能量点切分功能
+- **R8**: 实现 Energy 策略（基于 RMS 能量的语音/非语音检测）
+- **R9**: 实现 VAD 策略（基于 webrtcvad）+ Auto-strategy（自动策略选择）
+- **R10**: 可视化/调参友好输出（debug exports）+ summarize 命令 + 片段 notes/flags
+  - 片段扩充 flags/source/quality 字段，便于前端高亮
+  - 导出 timeline.json、segments.csv、mask.json 等可视化友好文件
+  - 新增 `summarize` 子命令，快速浏览 segments.jsonl 摘要
+  - 在 seg_report.json 和 run_summary.json 中记录 exports 统计

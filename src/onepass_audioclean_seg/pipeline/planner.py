@@ -49,6 +49,10 @@ class SegmentPlanner:
         emit_segments: bool = False,
         silence_threshold_db: float = -35.0,
         validate_output: bool = False,
+        export_timeline: bool = False,
+        export_csv: bool = False,
+        export_mask: str = "none",
+        mask_bin_ms: float = 50.0,
     ):
         """
         Args:
@@ -58,6 +62,10 @@ class SegmentPlanner:
             emit_segments: 是否生成语音片段
             silence_threshold_db: 静音检测阈值（dB）
             validate_output: 是否在生成 segments.jsonl 后立即验证
+            export_timeline: 是否导出 timeline.json（R10）
+            export_csv: 是否导出 segments.csv（R10）
+            export_mask: 导出 mask.json 的模式（none|energy|vad|auto，R10）
+            mask_bin_ms: mask 降采样 bin 大小（毫秒，R10）
         """
         self.dry_run = dry_run
         self.overwrite = overwrite
@@ -65,6 +73,10 @@ class SegmentPlanner:
         self.emit_segments = emit_segments
         self.silence_threshold_db = silence_threshold_db
         self.validate_output = validate_output
+        self.export_timeline = export_timeline
+        self.export_csv = export_csv
+        self.export_mask = export_mask
+        self.mask_bin_ms = mask_bin_ms
         self.job_stats: list[dict[str, Any]] = []  # 记录每个 job 的统计信息
         self.started_at = datetime.now().isoformat()
         self.has_any_error = False  # 记录是否有任何错误
@@ -347,15 +359,32 @@ class SegmentPlanner:
             # 8. R6: 通过合并短段来强制最小时长
             min_seg_sec = params.get("min_seg_sec", 1.0)
             max_seg_sec = params.get("max_seg_sec", 25.0)
+            # R10: 跟踪 merge 操作
+            segments_before_merge = merged_segments.copy()
             merged_segments = enforce_min_duration_by_merge(merged_segments, min_seg_sec, max_seg_sec)
+            from onepass_audioclean_seg.pipeline.segment_flags import track_postprocess_history
+            merge_flags_map = track_postprocess_history(segments_before_merge, merged_segments, "merge")
             
             # 9. R6: 通过切分超长段来强制最大时长
             split_strategy = params.get("split_strategy", "equal")
+            # R10: 跟踪 split 操作
+            segments_before_split = merged_segments.copy()
             final_segments = enforce_max_duration_by_split(merged_segments, max_seg_sec, min_seg_sec, split_strategy)
+            split_flags_map = track_postprocess_history(segments_before_split, final_segments, "split")
             
             # 最终排序和 round(3)
             final_segments = sorted(final_segments, key=lambda x: x[0])
             final_segments = [(round(s, 3), round(e, 3)) for s, e in final_segments]
+            
+            # R10: 合并所有 flags
+            all_flags_map: dict[tuple[float, float], list[str]] = {}
+            for seg in final_segments:
+                flags = []
+                if seg in split_flags_map:
+                    flags.extend(split_flags_map[seg])
+                if seg in merge_flags_map:
+                    flags.extend(merge_flags_map[seg])
+                all_flags_map[seg] = flags
             
             # 10. R6: 构建 SegmentRecord 列表（计算 pre_silence_sec、post_silence_sec、rms、energy_db）
             segments_records = []
@@ -417,6 +446,38 @@ class SegmentPlanner:
                         logger.warning(f"计算 RMS 失败 {seg_id}: {e}")
                         warnings_list.append(f"计算 RMS 失败 {seg_id}: {str(e)[:100]}")
                     
+                    # R10: 计算 flags
+                    low_energy_rms_threshold = params.get("low_energy_rms_threshold", 0.01)
+                    history_flags = all_flags_map.get((start, end), [])
+                    from onepass_audioclean_seg.pipeline.segment_flags import (
+                        compute_flags_for_segment,
+                        build_source_info,
+                        build_quality_info,
+                    )
+                    flags = compute_flags_for_segment(
+                        segment=(start, end),
+                        duration_sec=duration_sec,
+                        rms=rms,
+                        low_energy_rms_threshold=low_energy_rms_threshold,
+                        history_flags=history_flags,
+                    )
+                    
+                    # R10: 构建 source 信息
+                    # 尝试找到在 speech_segments_raw 中的原始索引
+                    raw_index = None
+                    for idx, (raw_start, raw_end) in enumerate(speech_segments):
+                        if abs(raw_start - start) < 0.01 and abs(raw_end - end) < 0.01:
+                            raw_index = idx
+                            break
+                    source = build_source_info(
+                        strategy=strategy_name,
+                        auto_chosen=False,
+                        raw_index=raw_index,
+                    )
+                    
+                    # R10: 构建 quality 信息
+                    quality = build_quality_info(rms=rms, energy_db=energy_db)
+                    
                     # R6: 导出 WAV 文件（如果启用）
                     notes = None
                     if emit_wav and wav_dir:
@@ -454,12 +515,57 @@ class SegmentPlanner:
                         rms=rms,
                         energy_db=energy_db,
                         notes=notes,
+                        flags=flags,
+                        source=source,
+                        quality=quality,
                     )
                     segments_records.append(record)
             
             # 9. 写入 segments.jsonl
             segments_path = job.out_dir / "segments.jsonl"
             write_segments_jsonl(segments_path, segments_records)
+            
+            # R10: 导出可视化友好文件
+            exports = {}
+            if self.export_timeline:
+                from onepass_audioclean_seg.io.exports import export_timeline_json
+                from onepass_audioclean_seg.io.report import read_seg_report
+                report = read_seg_report(job.out_dir / "seg_report.json")
+                auto_strategy = report.get("auto_strategy") if report else None
+                timeline_path = export_timeline_json(
+                    out_dir=job.out_dir,
+                    segments_records=segments_records,
+                    audio_path=job.audio_path,
+                    duration_sec=duration_sec,
+                    strategy=strategy_name,
+                    auto_strategy=auto_strategy,
+                    params=params,
+                )
+                exports["timeline_json"] = str(timeline_path.resolve())
+            
+            if self.export_csv:
+                from onepass_audioclean_seg.io.exports import export_segments_csv
+                csv_path = export_segments_csv(
+                    out_dir=job.out_dir,
+                    segments_records=segments_records,
+                )
+                exports["segments_csv"] = str(csv_path.resolve())
+            
+            if self.export_mask != "none":
+                from onepass_audioclean_seg.io.exports import export_mask_json
+                mask_strategy = self.export_mask
+                if mask_strategy == "auto":
+                    mask_strategy = strategy_name
+                mask_path = export_mask_json(
+                    out_dir=job.out_dir,
+                    duration_sec=duration_sec,
+                    strategy=mask_strategy,
+                    bin_ms=self.mask_bin_ms,
+                    analysis_result=analysis_result,
+                    segments_records=segments_records,
+                )
+                if mask_path:
+                    exports["mask_json"] = str(mask_path.resolve())
             
             # 10. 如果启用 validate_output，立即验证
             if self.validate_output:
@@ -505,6 +611,9 @@ class SegmentPlanner:
                     outputs["vad_json"] = str(vad_path.resolve())
             if wav_dir and wav_dir.exists():
                 outputs["segments_wav_dir"] = str(wav_dir.resolve())
+            # R10: 添加 exports
+            if exports:
+                outputs["exports"] = exports
             segments_report_data["outputs"] = outputs
             
             update_seg_report_segments(job.out_dir, segments_report_data)
@@ -643,12 +752,30 @@ class SegmentPlanner:
             
             min_seg_sec = params.get("min_seg_sec", 1.0)
             max_seg_sec = params.get("max_seg_sec", 25.0)
+            # R10: 跟踪 merge 操作
+            segments_before_merge = merged_segments.copy()
             merged_segments = enforce_min_duration_by_merge(merged_segments, min_seg_sec, max_seg_sec)
+            from onepass_audioclean_seg.pipeline.segment_flags import track_postprocess_history
+            merge_flags_map = track_postprocess_history(segments_before_merge, merged_segments, "merge")
             
             split_strategy = params.get("split_strategy", "equal")
+            # R10: 跟踪 split 操作
+            segments_before_split = merged_segments.copy()
             final_segments = enforce_max_duration_by_split(merged_segments, max_seg_sec, min_seg_sec, split_strategy)
+            split_flags_map = track_postprocess_history(segments_before_split, final_segments, "split")
+            
             final_segments = sorted(final_segments, key=lambda x: x[0])
             final_segments = [(round(s, 3), round(e, 3)) for s, e in final_segments]
+            
+            # R10: 合并所有 flags
+            all_flags_map: dict[tuple[float, float], list[str]] = {}
+            for seg in final_segments:
+                flags = []
+                if seg in split_flags_map:
+                    flags.extend(split_flags_map[seg])
+                if seg in merge_flags_map:
+                    flags.extend(merge_flags_map[seg])
+                all_flags_map[seg] = flags
             
             # 构建 SegmentRecord 列表（复用现有逻辑）
             segments_records = []
@@ -700,6 +827,37 @@ class SegmentPlanner:
                         logger.warning(f"计算 RMS 失败 {seg_id}: {e}")
                         warnings_list.append(f"计算 RMS 失败 {seg_id}: {str(e)[:100]}")
                     
+                    # R10: 计算 flags
+                    low_energy_rms_threshold = params.get("low_energy_rms_threshold", 0.01)
+                    history_flags = all_flags_map.get((start, end), [])
+                    from onepass_audioclean_seg.pipeline.segment_flags import (
+                        compute_flags_for_segment,
+                        build_source_info,
+                        build_quality_info,
+                    )
+                    flags = compute_flags_for_segment(
+                        segment=(start, end),
+                        duration_sec=duration_sec,
+                        rms=rms,
+                        low_energy_rms_threshold=low_energy_rms_threshold,
+                        history_flags=history_flags,
+                    )
+                    
+                    # R10: 构建 source 信息
+                    raw_index = None
+                    for idx, (raw_start, raw_end) in enumerate(speech_segments):
+                        if abs(raw_start - start) < 0.01 and abs(raw_end - end) < 0.01:
+                            raw_index = idx
+                            break
+                    source = build_source_info(
+                        strategy=chosen_strategy,
+                        auto_chosen=True,
+                        raw_index=raw_index,
+                    )
+                    
+                    # R10: 构建 quality 信息
+                    quality = build_quality_info(rms=rms, energy_db=energy_db)
+                    
                     notes = None
                     if emit_wav and wav_dir:
                         wav_path = wav_dir / f"{seg_id}.wav"
@@ -734,12 +892,57 @@ class SegmentPlanner:
                         rms=rms,
                         energy_db=energy_db,
                         notes=notes,
+                        flags=flags,
+                        source=source,
+                        quality=quality,
                     )
                     segments_records.append(record)
             
             # 写入 segments.jsonl
             segments_path = job.out_dir / "segments.jsonl"
             write_segments_jsonl(segments_path, segments_records)
+            
+            # R10: 导出可视化友好文件
+            exports = {}
+            if self.export_timeline:
+                from onepass_audioclean_seg.io.exports import export_timeline_json
+                from onepass_audioclean_seg.io.report import read_seg_report
+                report = read_seg_report(job.out_dir / "seg_report.json")
+                auto_strategy = report.get("auto_strategy") if report else None
+                timeline_path = export_timeline_json(
+                    out_dir=job.out_dir,
+                    segments_records=segments_records,
+                    audio_path=job.audio_path,
+                    duration_sec=duration_sec,
+                    strategy=chosen_strategy,
+                    auto_strategy=auto_strategy,
+                    params=params,
+                )
+                exports["timeline_json"] = str(timeline_path.resolve())
+            
+            if self.export_csv:
+                from onepass_audioclean_seg.io.exports import export_segments_csv
+                csv_path = export_segments_csv(
+                    out_dir=job.out_dir,
+                    segments_records=segments_records,
+                )
+                exports["segments_csv"] = str(csv_path.resolve())
+            
+            if self.export_mask != "none":
+                from onepass_audioclean_seg.io.exports import export_mask_json
+                mask_strategy = self.export_mask
+                if mask_strategy == "auto":
+                    mask_strategy = chosen_strategy
+                mask_path = export_mask_json(
+                    out_dir=job.out_dir,
+                    duration_sec=duration_sec,
+                    strategy=mask_strategy,
+                    bin_ms=self.mask_bin_ms,
+                    analysis_result=chosen_result,
+                    segments_records=segments_records,
+                )
+                if mask_path:
+                    exports["mask_json"] = str(mask_path.resolve())
             
             # 验证输出
             if self.validate_output:
@@ -783,6 +986,9 @@ class SegmentPlanner:
                     outputs["vad_json"] = str(vad_path.resolve())
             if wav_dir and wav_dir.exists():
                 outputs["segments_wav_dir"] = str(wav_dir.resolve())
+            # R10: 添加 exports
+            if exports:
+                outputs["exports"] = exports
             segments_report_data["outputs"] = outputs
             
             update_seg_report_segments(job.out_dir, segments_report_data)
@@ -957,6 +1163,8 @@ class SegmentPlanner:
         # 计算 totals
         speech_total_sec = 0.0
         silences_total_sec = 0.0
+        exports_written_total = 0
+        per_strategy_exports_count: dict[str, int] = {}
         
         for job in jobs:
             # 读取 seg_report.json 获取统计信息
@@ -978,6 +1186,14 @@ class SegmentPlanner:
                     if isinstance(silence_data, dict):
                         silences_total_sec += silence_data.get("silences_total_sec", 0.0)
                     # 尝试从 energy 策略获取（energy 策略不直接提供 silences_total_sec，跳过）
+                    
+                    # R10: 统计 exports
+                    outputs = segments_data.get("outputs", {})
+                    exports = outputs.get("exports", {})
+                    if exports:
+                        exports_written_total += len(exports)
+                        strategy = segments_data.get("strategy", "unknown")
+                        per_strategy_exports_count[strategy] = per_strategy_exports_count.get(strategy, 0) + len(exports)
                 except Exception:
                     pass  # 读取失败，跳过
         
@@ -1005,6 +1221,13 @@ class SegmentPlanner:
             "failures": jobs_failed,
             "dry_run": self.dry_run,
         }
+        
+        # R10: 添加 exports 统计
+        if exports_written_total > 0:
+            summary["exports"] = {
+                "exports_written_total": exports_written_total,
+                "per_strategy_exports_count": per_strategy_exports_count,
+            }
         
         # 写入文件
         summary_path = summary_dir / "run_summary.json"
